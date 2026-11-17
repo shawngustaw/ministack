@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Fixed
+- **Lambda — `equals-ignore-case` in event-source-mapping `FilterCriteria`** — the operator matched nothing, so a mapping filtering on it never invoked its function. It now matches a string value whatever its case, with EventBridge's case folding. A pattern nested under a field the record lacks (`"reservationLock": {"BOOL": [{"exists": false}, false]}` on an item without `reservationLock`) now treats the field as absent, so `{"exists": false}` matches it, and `anything-but` no longer matches a missing field.
 - **ElastiCache — respawn after a Docker restart** — restoring state re-created each cache cluster, replication group and serverless cache container under its old name; a stopped container left under that name (a Docker engine restart stops them all) made the create fail with a `409` name conflict, the group kept reporting the old container's address, and the log still said "respawned". A stopped container MiniStack's ElastiCache created under that name is now removed first, and a respawn that fails is logged as a failure naming the resource.
 
 ## [1.5.41] — 2026-11-14

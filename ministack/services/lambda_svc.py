@@ -3899,7 +3899,10 @@ def _match_esm_filter(record: dict, pattern: dict) -> bool:
     for key, pat in pattern.items():
         rec_val = record.get(key)
         if isinstance(pat, dict):
-            if not isinstance(rec_val, dict) or not _match_esm_filter(rec_val, pat):
+            # A field the record lacks is absent all the way down, so only an
+            # {"exists": false} under it can match (as in EventBridge, whose
+            # pattern syntax FilterCriteria uses).
+            if not _match_esm_filter(rec_val if isinstance(rec_val, dict) else {}, pat):
                 return False
         elif isinstance(pat, list):
             # Each entry can be a scalar equality check or a content-filter dict
@@ -3918,11 +3921,18 @@ def _match_esm_filter(record: dict, pattern: dict) -> bool:
                     elif "suffix" in p:
                         if isinstance(rec_val, str) and rec_val.endswith(p["suffix"]):
                             matched_any = True; break
+                    elif "equals-ignore-case" in p:
+                        # EventBridge's matcher, so case folding agrees with rules
+                        # and Pipes filters; only a string value can match.
+                        from ministack.services.eventbridge import _matches_equals_ignore_case
+                        if _matches_equals_ignore_case(rec_val, p["equals-ignore-case"]):
+                            matched_any = True; break
                     elif "anything-but" in p:
                         banned = p["anything-but"]
                         if not isinstance(banned, list):
                             banned = [banned]
-                        if rec_val not in banned:
+                        # Like every operator but {"exists": false}, it needs the field.
+                        if key in record and rec_val not in banned:
                             matched_any = True; break
                     elif "numeric" in p:
                         ops = p["numeric"]

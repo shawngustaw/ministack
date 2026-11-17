@@ -7678,6 +7678,59 @@ def test_match_esm_filter_content_prefix_suffix_anything_but():
     assert lsvc._match_esm_filter(rec, {"body": {"name": [{"exists": True}]}}) is True
 
 
+def test_match_esm_filter_equals_ignore_case():
+    """equals-ignore-case matches a string value whatever its case (AWS Lambda event filtering docs)."""
+    pat = {"eventName": [{"equals-ignore-case": "MODIFY"}]}
+    for value in ("MODIFY", "modify", "Modify"):
+        assert lsvc._match_esm_filter({"eventName": value}, pat) is True
+    assert lsvc._match_esm_filter({"eventName": "INSERT"}, pat) is False
+    assert lsvc._match_esm_filter({"eventName": 1}, pat) is False, "only a string can match"
+    assert lsvc._match_esm_filter({}, pat) is False
+
+
+def test_match_esm_filter_equals_ignore_case_in_a_dynamodb_image_with_exists():
+    """The reservation-lock-deleter filter: equals-ignore-case inside a NewImage path, next to
+    {"exists": false} alternatives on attributes the item may not have."""
+    pat = {
+        "eventName": [{"equals-ignore-case": "MODIFY"}],
+        "dynamodb": {"NewImage": {
+            "__edb_e__": {"S": [{"equals-ignore-case": "ReservationLock"}]},
+            "reservationLock": {"BOOL": [{"exists": False}, False]},
+            "orderLock": {"BOOL": [{"exists": False}, False]},
+        }},
+    }
+
+    def record(event_name="MODIFY", entity="reservationlock", **image):
+        return {"eventName": event_name,
+                "dynamodb": {"NewImage": {"__edb_e__": {"S": entity}, **image}}}
+
+    assert lsvc._match_esm_filter(record(reservationLock={"BOOL": False}, orderLock={"BOOL": False}), pat)
+    # An attribute the item lacks is absent all the way down, so {"exists": false} matches it.
+    assert lsvc._match_esm_filter(record(), pat)
+    assert lsvc._match_esm_filter(record(reservationLock={"BOOL": False}), pat)
+    assert not lsvc._match_esm_filter(record(reservationLock={"BOOL": True}), pat)
+    assert not lsvc._match_esm_filter(record(entity="Reservation"), pat)
+    assert not lsvc._match_esm_filter(record(event_name="INSERT"), pat)
+
+
+def test_match_esm_filter_operators_need_the_field_except_exists_false():
+    """Under a field the record lacks, only {"exists": false} matches; anything-but needs the field."""
+    rec = {"body": {"name": "x"}}
+    assert lsvc._match_esm_filter(rec, {"body": {"missing": {"inner": [{"exists": False}]}}}) is True
+    assert lsvc._match_esm_filter(rec, {"body": {"missing": {"inner": [{"exists": True}]}}}) is False
+    assert lsvc._match_esm_filter(rec, {"body": {"missing": [{"anything-but": ["y"]}]}}) is False
+    assert lsvc._match_esm_filter(rec, {"body": {"name": {"inner": ["x"]}}}) is False
+
+
+def test_apply_filter_criteria_equals_ignore_case_on_sqs_bodies():
+    import json as _json
+    esm = {"FilterCriteria": {"Filters": [
+        {"Pattern": _json.dumps({"body": {"status": [{"equals-ignore-case": "active"}]}})},
+    ]}}
+    records = [{"messageId": m, "body": _json.dumps({"status": m})} for m in ("ACTIVE", "Active", "inactive")]
+    assert [r["messageId"] for r in lsvc._apply_filter_criteria(records, esm)] == ["ACTIVE", "Active"]
+
+
 def test_match_esm_filter_numeric():
     """Numeric comparison operator."""
     rec = {"body": {"count": 7}}
