@@ -259,8 +259,34 @@ def _poll_pipe(_ddb, pipe: dict, pipe_account_id: str) -> None:
         return
 
     batch = _ddb.stream_records_since(table_name, pos, end - pos, **scope)
-    if _deliver_batch(pipe, batch):
+    # Records no filter matches are consumed, not retried: the position moves
+    # past them whether or not anything is left to deliver.
+    passed = [record for record in batch if _passes_filters(pipe, record)]
+    if not passed or _deliver_batch(pipe, passed):
         _positions[pipe["Arn"]] = pos + len(batch)
+
+
+def _passes_filters(pipe: dict, record) -> bool:
+    """Whether the record matches one of SourceParameters.FilterCriteria.Filters, or
+    the pipe has none. Patterns use EventBridge's syntax and matcher, so operators
+    such as equals-ignore-case, exists and prefix behave as in rules. A pattern
+    EventBridge would refuse matches nothing."""
+    from ministack.services import eventbridge as _eb
+
+    criteria = (pipe.get("SourceParameters") or {}).get("FilterCriteria") or {}
+    patterns = [f.get("Pattern") for f in criteria.get("Filters") or []
+                if isinstance(f, dict) and f.get("Pattern")]
+    if not patterns:
+        return True
+    for pattern in patterns:
+        alternatives = _eb._compiled_pattern(pattern) if isinstance(pattern, str) else None
+        if alternatives is None:
+            logger.warning("Pipes %s: filter pattern is not valid; it matches nothing: %s",
+                           pipe.get("Name"), pattern)
+            continue
+        if any(_eb._matches_detail(record, alternative) for alternative in alternatives):
+            return True
+    return False
 
 
 def _deliver_batch(pipe: dict, batch: list) -> bool:

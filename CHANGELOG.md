@@ -8,6 +8,7 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 ## [Unreleased]
 
 ### Added
+- **EventBridge Pipes — `FilterCriteria`** — `SourceParameters.FilterCriteria` was ignored, so every stream record reached the target. A record now goes on only when one of the filters matches it, with EventBridge's pattern syntax and matcher (`equals-ignore-case`, `exists`, `prefix`, ...); records no filter matches are consumed, and the pipe's position moves past them.
 - **EventBridge Pipes — SQS queue and event bus targets** — a pipe to either logged "holding N record(s)" on every poll and delivered nothing. Each record now goes to an SQS queue through `SendMessage` (a FIFO queue takes `SqsQueueParameters.MessageGroupId` and `MessageDeduplicationId`, literal or `$.` path), or onto an event bus through `PutEvents` with the record as `detail`, so the bus's rules match it. `EventBridgeEventBusParameters` set `Source`, `DetailType`, `Resources` and `Time`; without them the event's `source` is `Pipe <name>` and its `detail-type` `Event from <eventSource>` (not captured from AWS). A refused delivery keeps the batch on the stream, as before.
 
 ### Fixed

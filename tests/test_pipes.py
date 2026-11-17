@@ -712,6 +712,69 @@ def test_pipes_event_bus_target_takes_event_bus_parameters(target_env):
         "%Y-%m-%dT%H:%M:%SZ")
 
 
+def _filters(*patterns):
+    return {"SourceParameters": {"FilterCriteria": {"Filters": [{"Pattern": json.dumps(p)} for p in patterns]}}}
+
+
+def test_pipes_filter_drops_records_no_pattern_matches(target_env):
+    _sqs, _eb = target_env
+    queue_arn, queue = _queue(_sqs, "filtered")
+    records = [_ddb_record("INSERT", pk="1"), _ddb_record("REMOVE", pk="2"), _ddb_record("MODIFY", pk="3")]
+    pipe_arn = _pipe_to(queue_arn, records, **_filters({"eventName": ["REMOVE"]}, {"eventName": ["MODIFY"]}))
+
+    _pipes._poll_once()
+
+    assert [b["eventID"] for b in _bodies(queue)] == ["evt-2", "evt-3"]
+    assert _pipes._positions[pipe_arn] == 3
+
+
+def test_pipes_filtered_out_records_still_advance_the_position(target_env):
+    """A batch the filters drop entirely is consumed, not held or retried."""
+    _sqs, _eb = target_env
+    queue_arn, queue = _queue(_sqs, "filtered")
+    pipe_arn = _pipe_to(queue_arn, [_ddb_record("INSERT")], **_filters({"eventName": ["REMOVE"]}))
+
+    _pipes._poll_once()
+    _pipes._poll_once()
+
+    assert queue["messages"] == []
+    assert _pipes._positions[pipe_arn] == 1
+
+
+def test_pipes_filter_uses_eventbridge_operators_in_a_nested_image(target_env):
+    """The reservation-lock-created filter: equals-ignore-case on eventName and inside NewImage."""
+    _sqs, _eb = target_env
+    queue_arn, queue = _queue(_sqs, "filtered")
+    records = [
+        _ddb_record("INSERT", pk="1", entity="reservationlock"),
+        _ddb_record("INSERT", pk="2", entity="Reservation"),
+        _ddb_record("MODIFY", pk="3", entity="ReservationLock"),
+    ]
+    _pipe_to(queue_arn, records, **_filters({
+        "eventName": [{"equals-ignore-case": "insert"}],
+        "dynamodb": {"NewImage": {"__edb_e__": {"S": [{"equals-ignore-case": "ReservationLock"}]},
+                                  "missing": [{"exists": False}]}},
+    }))
+
+    _pipes._poll_once()
+
+    assert [b["eventID"] for b in _bodies(queue)] == ["evt-1"]
+
+
+def test_pipes_filter_pattern_eventbridge_refuses_matches_nothing(target_env, caplog):
+    _sqs, _eb = target_env
+    queue_arn, queue = _queue(_sqs, "filtered")
+    pipe_arn = _pipe_to(queue_arn, [_ddb_record()], SourceParameters={
+        "FilterCriteria": {"Filters": [{"Pattern": "{not json"}]}})
+
+    with caplog.at_level("WARNING"):
+        _pipes._poll_once()
+
+    assert queue["messages"] == []
+    assert _pipes._positions[pipe_arn] == 1
+    assert "filter pattern is not valid" in caplog.text
+
+
 def test_pipes_json_path():
     doc = {"a": {"b": [{"c": 1}, {"c": 2}]}, "s": "x"}
     assert _pipes._json_path(doc, "$.a.b[1].c") == 2
