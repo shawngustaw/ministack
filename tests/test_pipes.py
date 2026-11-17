@@ -775,6 +775,88 @@ def test_pipes_filter_pattern_eventbridge_refuses_matches_nothing(target_env, ca
     assert "filter pattern is not valid" in caplog.text
 
 
+_LOCK_TEMPLATE = """{
+  "type": "reservation.lock",
+  "action": "created",
+  "orgId": "<$.dynamodb.NewImage.orgId.S>",
+  "timestamp": <$.dynamodb.ApproximateCreationDateTime>,
+  "availabilityToken": "<$.dynamodb.NewImage.availabilityToken.S>"
+}"""
+
+
+def _lock_record():
+    record = _ddb_record("INSERT", entity="ReservationLock")
+    record["dynamodb"]["NewImage"].update({"orgId": {"S": "org-1"}, "availabilityToken": {"S": "tok-1"}})
+    return record
+
+
+def test_pipes_input_template_fills_quoted_and_unquoted_placeholders(target_env):
+    """Quoted placeholders insert text; an unquoted one inserts raw JSON (here a number), so
+    the template is only valid JSON once filled in."""
+    _sqs, _eb = target_env
+    queue_arn, queue = _queue(_sqs, "templated")
+    record = _lock_record()
+    _pipe_to(queue_arn, [record], TargetParameters={"InputTemplate": _LOCK_TEMPLATE})
+
+    _pipes._poll_once()
+
+    assert _bodies(queue) == [{
+        "type": "reservation.lock",
+        "action": "created",
+        "orgId": "org-1",
+        "timestamp": record["dynamodb"]["ApproximateCreationDateTime"],
+        "availabilityToken": "tok-1",
+    }]
+
+
+def test_pipes_input_template_shapes_the_event_bus_detail(target_env):
+    """The availability bus rule matches on detail.type, which only the template's output has."""
+    _sqs, _eb = target_env
+    bus_arn, observed = _bus_with_rule_to_queue(_sqs, _eb, {"detail": {"type": ["reservation.lock"]}})
+    _pipe_to(bus_arn, [_lock_record()], TargetParameters={"InputTemplate": _LOCK_TEMPLATE})
+
+    _pipes._poll_once()
+
+    (event,) = _bodies(observed)
+    assert event["detail"]["orgId"] == "org-1" and event["detail"]["action"] == "created"
+
+
+def test_pipes_input_template_reserved_variables_objects_and_missing_paths(target_env):
+    _sqs, _eb = target_env
+    queue_arn, queue = _queue(_sqs, "templated")
+    record = _ddb_record(pk="9")
+    _pipe_to(queue_arn, [record], TargetParameters={"InputTemplate": (
+        '{"pipe": <aws.pipes.pipe-name>, "keys": <$.dynamodb.Keys>, "inline": "k=<$.dynamodb.Keys>", '
+        '"missing": "<$.dynamodb.NewImage.nope.S>", "event": <aws.pipes.event.json>}')})
+
+    _pipes._poll_once()
+
+    (body,) = _bodies(queue)
+    assert body["pipe"] == "PipeName"
+    assert body["keys"] == {"pk": {"S": "9"}}
+    assert body["inline"] == "k={pk: {S: 9}}", "an object inside a string loses its inner quotes"
+    assert body["missing"] == ""
+    assert body["event"] == record
+
+
+def test_pipes_input_template_applies_to_sns_and_state_machine_targets(target_env, monkeypatch):
+    from ministack.services import sns as _sns
+    from ministack.services import stepfunctions as _sfn
+
+    published, started = [], []
+    monkeypatch.setattr(_sns, "publish_internal", lambda arn, message, subject: published.append(message) or {})
+    monkeypatch.setattr(_sfn, "_start_execution", lambda data: started.append(data) or json_response({}))
+    template = {"TargetParameters": {"InputTemplate": '{"pk": "<$.dynamodb.Keys.pk.S>"}'}}
+
+    _pipe_to(_topic_arn(_REGION), [_ddb_record(pk="1")], **template)
+    _pipes._poll_once()
+    _pipe_to(f"arn:aws:states:{_REGION}:{_ACCOUNT}:stateMachine:M", [_ddb_record(pk="2")], **template)
+    _pipes._poll_once()
+
+    assert [json.loads(m) for m in published] == [{"pk": "1"}]
+    assert json.loads(started[0]["input"]) == [{"pk": "2"}], "applied per record inside the batch array"
+
+
 def test_pipes_json_path():
     doc = {"a": {"b": [{"c": 1}, {"c": 2}]}, "s": "x"}
     assert _pipes._json_path(doc, "$.a.b[1].c") == 2

@@ -311,6 +311,56 @@ def _deliver_batch(pipe: dict, batch: list) -> bool:
     return False
 
 
+def _payload(pipe: dict, record) -> str:
+    """What the target receives for one record: TargetParameters.InputTemplate
+    filled from the record, or the record itself as JSON."""
+    template = (pipe.get("TargetParameters") or {}).get("InputTemplate")
+    if not isinstance(template, str) or not template:
+        return json.dumps(record)
+    return _render_template(template, pipe, record)
+
+
+def _payload_value(pipe: dict, record):
+    """The payload as a JSON value, for targets that carry it inside JSON (a
+    Step Functions input array, an event's detail): parsed when it is JSON,
+    else the text itself."""
+    text = _payload(pipe, record)
+    try:
+        return json.loads(text)
+    except ValueError:
+        return text
+
+
+def _render_template(template: str, pipe: dict, record) -> str:
+    """Fill ``<$.path>`` and ``<aws.pipes.*>`` placeholders the way the Pipes
+    input-transformation docs describe, with EventBridge's renderer, whose rules
+    are the same: inside quotes a value is inserted as text (an object or array
+    loses its inner quotes), outside quotes a string is quoted and anything else
+    inserted as raw JSON. A path the record lacks is an empty string."""
+    from datetime import datetime, timezone
+
+    from ministack.services import eventbridge as _eb
+
+    reserved = {
+        "aws.pipes.pipe-arn": pipe.get("Arn", ""),
+        "aws.pipes.pipe-name": pipe.get("Name", ""),
+        "aws.pipes.source-arn": pipe.get("Source", ""),
+        "aws.pipes.enrichment-arn": pipe.get("Enrichment", ""),
+        "aws.pipes.target-arn": pipe.get("Target", ""),
+        "aws.pipes.event.ingestion-time": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "aws.pipes.event": record,
+        "aws.pipes.event.json": record,
+    }
+    replacements = {}
+    for name in _eb._PLACEHOLDER_RE.findall(template):
+        if name in reserved:
+            replacements[name] = reserved[name]
+        elif name.startswith("$"):
+            value = _json_path(record, name)
+            replacements[name] = "" if value is _MISSING else value
+    return _eb._render_input_template(template, replacements)
+
+
 def _target_parameters(pipe: dict, key: str) -> dict:
     params = (pipe.get("TargetParameters") or {}).get(key)
     return params if isinstance(params, dict) else {}
@@ -367,7 +417,7 @@ def _send_records_to_sqs(queue_arn: str, pipe: dict, records: list) -> bool:
         return False
     params = _target_parameters(pipe, "SqsQueueParameters")
     for record in records:
-        request = {"QueueUrl": queue["url"], "MessageBody": json.dumps(record)}
+        request = {"QueueUrl": queue["url"], "MessageBody": _payload(pipe, record)}
         if queue.get("is_fifo"):
             for key in ("MessageGroupId", "MessageDeduplicationId"):
                 value = _dynamic(params.get(key), record)
@@ -396,7 +446,7 @@ def _event_bus_entry(bus_arn: str, pipe: dict, record) -> dict:
         "EventBusName": bus_arn,
         "Source": _dynamic(params.get("Source"), record) or f"Pipe {pipe.get('Name', '')}",
         "DetailType": _dynamic(params.get("DetailType"), record) or f"Event from {event_source}",
-        "Detail": json.dumps(record),
+        "Detail": json.dumps(_payload_value(pipe, record)),
         "Resources": [r for r in (_dynamic(r, record) for r in params.get("Resources") or []) if r],
     }
     if params.get("Time"):
@@ -436,7 +486,7 @@ def _start_state_machine_from_records(sm_arn: str, pipe: dict, records: list) ->
 
     status, _headers, body = _sfn._start_execution({
         "stateMachineArn": sm_arn,
-        "input": json.dumps(records),
+        "input": json.dumps([_payload_value(pipe, record) for record in records]),
     })
     if status >= 400:
         logger.warning("Pipes %s: StartExecution on %s failed (%s): %s",
@@ -449,7 +499,7 @@ def _publish_record_to_sns(topic_arn: str, pipe: dict, record: dict):
     from ministack.services import sns as _sns
 
     try:
-        result = _sns.publish_internal(topic_arn, json.dumps(record), f"Pipes {pipe.get('Name', '')}")
+        result = _sns.publish_internal(topic_arn, _payload(pipe, record), f"Pipes {pipe.get('Name', '')}")
     except _sns.SnsPublishError as exc:
         logger.warning("Pipes %s: SNS publish to %s refused: %s", pipe.get("Name"), topic_arn, exc)
         return
