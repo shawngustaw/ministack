@@ -11,7 +11,7 @@ SDK surface:
 
 Runtime (background poller + CloudFormation) scope is intentionally limited to:
 - Source: DynamoDB Streams
-- Target: SNS, Step Functions state machine
+- Target: SNS, Step Functions state machine, SQS queue, EventBridge event bus
 """
 
 import copy
@@ -275,10 +275,129 @@ def _deliver_batch(pipe: dict, batch: list) -> bool:
         for rec in batch:
             _publish_record_to_sns(target_arn, pipe, rec)
         return True
+    if target_service == "sqs":
+        return _send_records_to_sqs(target_arn, pipe, batch)
+    if target_service == "events":
+        return _put_records_on_event_bus(target_arn, pipe, batch)
     logger.warning(
-        "Pipes %s: holding %d record(s); MiniStack delivers to sns and states, "
+        "Pipes %s: holding %d record(s); MiniStack delivers to sns, sqs, states and events, "
         "not to %s", pipe.get("Name"), len(batch), target_service or target_arn)
     return False
+
+
+def _target_parameters(pipe: dict, key: str) -> dict:
+    params = (pipe.get("TargetParameters") or {}).get(key)
+    return params if isinstance(params, dict) else {}
+
+
+_MISSING = object()
+
+
+def _json_path(document, path: str):
+    """The value at a Pipes JSON path (``$.a.b[0]``) in ``document``, or ``_MISSING``.
+    Dot notation and array indices: the syntax the Pipes docs list for dynamic
+    parameters and input templates, without wildcards."""
+    if path == "$":
+        return document
+    if not path.startswith("$."):
+        return _MISSING
+    value = document
+    for part in path[2:].split("."):
+        name, _, rest = part.partition("[")
+        steps = [name] if name else []
+        while rest:
+            index, _, rest = rest.partition("]")
+            steps.append(int(index) if index.isdigit() else index)
+            rest = rest[1:] if rest.startswith("[") else rest
+        for step in steps:
+            if isinstance(step, int) and isinstance(value, list) and step < len(value):
+                value = value[step]
+            elif isinstance(step, str) and isinstance(value, dict) and step in value:
+                value = value[step]
+            else:
+                return _MISSING
+    return value
+
+
+def _dynamic(value, record):
+    """A target parameter: a literal, or a ``$.`` JSON path into the record
+    (Pipes "dynamic path parameters"). A path the record lacks gives None."""
+    if isinstance(value, str) and value.startswith("$."):
+        found = _json_path(record, value)
+        return None if found is _MISSING else found
+    return value
+
+
+def _send_records_to_sqs(queue_arn: str, pipe: dict, records: list) -> bool:
+    """Send each record to the queue as one message, through SQS's own SendMessage,
+    so the queue's delay, size limit and FIFO de-duplication apply.
+    ``SqsQueueParameters`` (``MessageGroupId``, ``MessageDeduplicationId``) are
+    passed for a FIFO queue. Stops at the first refusal; the batch is then held."""
+    from ministack.services import sqs as _sqs
+
+    queue = _sqs._queue_by_arn(queue_arn)
+    if queue is None:
+        logger.warning("Pipes %s: SQS queue %s not found", pipe.get("Name"), queue_arn)
+        return False
+    params = _target_parameters(pipe, "SqsQueueParameters")
+    for record in records:
+        request = {"QueueUrl": queue["url"], "MessageBody": json.dumps(record)}
+        if queue.get("is_fifo"):
+            for key in ("MessageGroupId", "MessageDeduplicationId"):
+                value = _dynamic(params.get(key), record)
+                if value is not None:
+                    request[key] = str(value)
+        try:
+            _sqs._act_send_message(request, queue["url"])
+        except _sqs._Err as exc:
+            logger.warning("Pipes %s: SendMessage to %s refused: %s: %s",
+                           pipe.get("Name"), queue_arn, exc.code, exc.message)
+            return False
+    return True
+
+
+def _event_bus_entry(bus_arn: str, pipe: dict, record) -> dict:
+    """The PutEvents entry for one record: the record is the event's ``detail``.
+
+    ``EventBridgeEventBusParameters`` set ``Source``, ``DetailType`` (literals
+    or JSON paths), ``Resources`` and ``Time`` (a JSON path). Without them,
+    ``source`` is ``Pipe <name>`` and ``detail-type`` ``Event from <eventSource>``:
+    not stated in the AWS docs and not captured from AWS; taken from events
+    seen from real pipes."""
+    params = _target_parameters(pipe, "EventBridgeEventBusParameters")
+    event_source = record.get("eventSource", "") if isinstance(record, dict) else ""
+    entry = {
+        "EventBusName": bus_arn,
+        "Source": _dynamic(params.get("Source"), record) or f"Pipe {pipe.get('Name', '')}",
+        "DetailType": _dynamic(params.get("DetailType"), record) or f"Event from {event_source}",
+        "Detail": json.dumps(record),
+        "Resources": [r for r in (_dynamic(r, record) for r in params.get("Resources") or []) if r],
+    }
+    if params.get("Time"):
+        time_value = _dynamic(params["Time"], record)
+        if time_value is not None:
+            entry["Time"] = time_value
+    return entry
+
+
+def _put_records_on_event_bus(bus_arn: str, pipe: dict, records: list) -> bool:
+    """Put each record on the bus through EventBridge's own PutEvents, so the
+    bus's rules match and dispatch it as they do any other event."""
+    from ministack.services import eventbridge as _eb
+
+    params = _target_parameters(pipe, "EventBridgeEventBusParameters")
+    entries = [_event_bus_entry(bus_arn, pipe, record) for record in records]
+    for start in range(0, len(entries), 10):  # PutEvents takes at most 10 entries
+        request = {"Entries": entries[start:start + 10]}
+        if params.get("EndpointId"):
+            request["EndpointId"] = params["EndpointId"]
+        status, _headers, body = _eb._put_events(request)
+        result = json.loads(body) if status < 400 else {}
+        if status >= 400 or result.get("FailedEntryCount"):
+            logger.warning("Pipes %s: PutEvents on %s failed (%s): %s",
+                           pipe.get("Name"), bus_arn, status, body)
+            return False
+    return True
 
 
 def _start_state_machine_from_records(sm_arn: str, pipe: dict, records: list) -> bool:

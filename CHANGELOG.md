@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Added
+- **EventBridge Pipes — SQS queue and event bus targets** — a pipe to either logged "holding N record(s)" on every poll and delivered nothing. Each record now goes to an SQS queue through `SendMessage` (a FIFO queue takes `SqsQueueParameters.MessageGroupId` and `MessageDeduplicationId`, literal or `$.` path), or onto an event bus through `PutEvents` with the record as `detail`, so the bus's rules match it. `EventBridgeEventBusParameters` set `Source`, `DetailType`, `Resources` and `Time`; without them the event's `source` is `Pipe <name>` and its `detail-type` `Event from <eventSource>` (not captured from AWS). A refused delivery keeps the batch on the stream, as before.
+
 ### Fixed
 - **Lambda — `equals-ignore-case` in event-source-mapping `FilterCriteria`** — the operator matched nothing, so a mapping filtering on it never invoked its function. It now matches a string value whatever its case, with EventBridge's case folding. A pattern nested under a field the record lacks (`"reservationLock": {"BOOL": [{"exists": false}, false]}` on an item without `reservationLock`) now treats the field as absent, so `{"exists": false}` matches it, and `anything-but` no longer matches a missing field.
 - **ElastiCache — respawn after a Docker restart** — restoring state re-created each cache cluster, replication group and serverless cache container under its old name; a stopped container left under that name (a Docker engine restart stops them all) made the create fail with a `409` name conflict, the group kept reporting the old container's address, and the log still said "respawned". A stopped container MiniStack's ElastiCache created under that name is now removed first, and a respawn that fails is logged as a failure naming the resource.

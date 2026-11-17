@@ -308,7 +308,7 @@ def test_pipes_target_this_poller_cannot_deliver_to_says_so(caplog):
     try:
         table_name = "PipeTable"
         source_arn = _stream_arn("us-east-1", table_name)
-        target_arn = "arn:aws:sqs:us-east-1:000000000000:PipeQueue"
+        target_arn = "arn:aws:kinesis:us-east-1:000000000000:stream/PipeStream"
         pipe_arn = "arn:aws:pipes:us-east-1:000000000000:pipe/PipeName"
 
         _ddb._stream_records.set_scoped(
@@ -327,7 +327,7 @@ def test_pipes_target_this_poller_cannot_deliver_to_says_so(caplog):
         with caplog.at_level("WARNING"):
             _pipes._poll_once()
 
-        assert "sqs" in caplog.text and "PipeName" in caplog.text
+        assert "kinesis" in caplog.text and "PipeName" in caplog.text
         assert _pipes._positions[pipe_arn] == 0
     finally:
         _request_region.reset(region_token)
@@ -539,6 +539,186 @@ def test_pipes_position_is_absolute_across_record_expiry(monkeypatch):
         _pipes.reset()
         _ddb._stream_records.clear()
         _ddb._stream_trimmed.clear()
+
+
+# ---------------------------------------------------------------------------
+# SQS and EventBridge event bus targets
+# ---------------------------------------------------------------------------
+
+_ACCOUNT = "000000000000"
+_REGION = "us-east-1"
+
+
+def _ddb_record(event_name="INSERT", pk="1", entity="Reservation", created=None):
+    """A stream record created now: older ones age out of the 24-hour stream retention."""
+    import time
+
+    created = int(time.time()) if created is None else created
+    return {
+        "eventID": f"evt-{pk}",
+        "eventName": event_name,
+        "eventSource": "aws:dynamodb",
+        "awsRegion": _REGION,
+        "dynamodb": {
+            "ApproximateCreationDateTime": created,
+            "Keys": {"pk": {"S": pk}},
+            "NewImage": {"pk": {"S": pk}, "__edb_e__": {"S": entity}},
+        },
+    }
+
+
+@pytest.fixture
+def target_env():
+    """Pipes, DynamoDB streams, SQS and EventBridge in-process, scoped to one account and Region."""
+    from ministack.services import eventbridge as _eb
+    from ministack.services import sqs as _sqs
+
+    set_request_account_id(_ACCOUNT)
+    set_request_region(_REGION)
+    for module in (_pipes, _sqs, _eb):
+        module.reset()
+    _ddb._stream_records.clear()
+    yield _sqs, _eb
+    for module in (_pipes, _sqs, _eb):
+        module.reset()
+    _ddb._stream_records.clear()
+
+
+def _queue(_sqs, name, **attributes):
+    url = _sqs._act_create_queue({"QueueName": name, "Attributes": attributes}, "")["QueueUrl"]
+    queue = _sqs._queues[url]
+    return queue["attributes"]["QueueArn"], queue
+
+
+def _bodies(queue):
+    return [json.loads(m["body"]) for m in queue["messages"]]
+
+
+def _pipe_to(target_arn, records, **fields):
+    _ddb._stream_records.set_scoped(_ACCOUNT, _REGION, "PipeTable", list(records))
+    pipe_arn = f"arn:aws:pipes:{_REGION}:{_ACCOUNT}:pipe/PipeName"
+    _pipes._pipes["PipeName"] = {
+        "Name": "PipeName",
+        "Arn": pipe_arn,
+        "Source": _stream_arn(_REGION),
+        "Target": target_arn,
+        "CurrentState": "RUNNING",
+        "StartingPosition": "TRIM_HORIZON",
+        **fields,
+    }
+    _pipes._positions[pipe_arn] = 0
+    return pipe_arn
+
+
+def test_pipes_sqs_target_sends_each_record_as_a_message(target_env):
+    _sqs, _eb = target_env
+    queue_arn, queue = _queue(_sqs, "pipe-queue")
+    records = [_ddb_record(pk="1"), _ddb_record(pk="2")]
+    pipe_arn = _pipe_to(queue_arn, records)
+
+    _pipes._poll_once()
+
+    assert _bodies(queue) == records
+    assert _pipes._positions[pipe_arn] == 2
+
+
+def test_pipes_sqs_fifo_target_takes_sqs_queue_parameters(target_env):
+    _sqs, _eb = target_env
+    queue_arn, queue = _queue(_sqs, "pipe-queue.fifo", FifoQueue="true")
+    _pipe_to(queue_arn, [_ddb_record(pk="7")], TargetParameters={"SqsQueueParameters": {
+        "MessageGroupId": "reservations", "MessageDeduplicationId": "$.dynamodb.Keys.pk.S"}})
+
+    _pipes._poll_once()
+
+    (message,) = queue["messages"]
+    assert message["group_id"] == "reservations"
+    assert message["dedup_id"] == "7"
+
+
+def test_pipes_sqs_target_holds_the_batch_when_sqs_refuses(target_env, caplog):
+    """A FIFO queue without a group id refuses the message; the records stay on the stream."""
+    _sqs, _eb = target_env
+    queue_arn, queue = _queue(_sqs, "pipe-queue.fifo", FifoQueue="true")
+    pipe_arn = _pipe_to(queue_arn, [_ddb_record()])
+
+    with caplog.at_level("WARNING"):
+        _pipes._poll_once()
+
+    assert queue["messages"] == []
+    assert _pipes._positions[pipe_arn] == 0
+    assert "MissingParameter" in caplog.text and "PipeName" in caplog.text
+
+
+def test_pipes_sqs_target_holds_the_batch_when_the_queue_does_not_exist(target_env, caplog):
+    pipe_arn = _pipe_to(f"arn:aws:sqs:{_REGION}:{_ACCOUNT}:missing", [_ddb_record()])
+
+    with caplog.at_level("WARNING"):
+        _pipes._poll_once()
+
+    assert _pipes._positions[pipe_arn] == 0
+    assert "not found" in caplog.text
+
+
+def _bus_with_rule_to_queue(_sqs, _eb, pattern):
+    queue_arn, queue = _queue(_sqs, "bus-observer")
+    _eb._create_event_bus({"Name": "pipe-bus"})
+    _eb._put_rule({"Name": "observe", "EventBusName": "pipe-bus", "EventPattern": json.dumps(pattern)})
+    _eb._put_targets({"Rule": "observe", "EventBusName": "pipe-bus",
+                      "Targets": [{"Id": "q", "Arn": queue_arn}]})
+    return f"arn:aws:events:{_REGION}:{_ACCOUNT}:event-bus/pipe-bus", queue
+
+
+def test_pipes_event_bus_target_puts_each_record_on_the_bus(target_env):
+    """Rules on the bus match the event the pipe puts there; the record is its detail."""
+    _sqs, _eb = target_env
+    bus_arn, observed = _bus_with_rule_to_queue(
+        _sqs, _eb, {"detail": {"dynamodb": {"NewImage": {"__edb_e__": {"S": ["Reservation"]}}}}})
+    records = [_ddb_record(pk="1"), _ddb_record(pk="2", entity="Other")]
+    pipe_arn = _pipe_to(bus_arn, records)
+
+    _pipes._poll_once()
+
+    (event,) = _bodies(observed)
+    assert event["detail"] == records[0]
+    assert event["source"] == "Pipe PipeName"
+    assert event["detail-type"] == "Event from aws:dynamodb"
+    assert event["account"] == _ACCOUNT and event["region"] == _REGION
+    assert event["resources"] == []
+    assert _pipes._positions[pipe_arn] == 2
+
+
+def test_pipes_event_bus_target_takes_event_bus_parameters(target_env):
+    import datetime
+
+    _sqs, _eb = target_env
+    bus_arn, observed = _bus_with_rule_to_queue(
+        _sqs, _eb, {"source": ["core.orders"], "detail-type": ["INSERT"]})
+    record = _ddb_record()
+    created = record["dynamodb"]["ApproximateCreationDateTime"]
+    _pipe_to(bus_arn, [record], TargetParameters={"EventBridgeEventBusParameters": {
+        "Source": "core.orders",
+        "DetailType": "$.eventName",
+        "Resources": ["arn:aws:dynamodb:us-east-1:000000000000:table/PipeTable"],
+        "Time": "$.dynamodb.ApproximateCreationDateTime",
+    }})
+
+    _pipes._poll_once()
+
+    (event,) = _bodies(observed)
+    assert event["source"] == "core.orders"
+    assert event["detail-type"] == "INSERT"
+    assert event["resources"] == ["arn:aws:dynamodb:us-east-1:000000000000:table/PipeTable"]
+    assert event["time"] == datetime.datetime.fromtimestamp(created, datetime.timezone.utc).strftime(
+        "%Y-%m-%dT%H:%M:%SZ")
+
+
+def test_pipes_json_path():
+    doc = {"a": {"b": [{"c": 1}, {"c": 2}]}, "s": "x"}
+    assert _pipes._json_path(doc, "$.a.b[1].c") == 2
+    assert _pipes._json_path(doc, "$.s") == "x"
+    assert _pipes._json_path(doc, "$") is doc
+    assert _pipes._json_path(doc, "$.a.missing") is _pipes._MISSING
+    assert _pipes._json_path(doc, "$.a.b[5]") is _pipes._MISSING
 
 
 # ---------------------------------------------------------------------------
