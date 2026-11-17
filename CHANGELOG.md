@@ -7,6 +7,9 @@ Versioning follows [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+### Fixed
+- **ElastiCache — respawn after a Docker restart** — restoring state re-created each cache cluster, replication group and serverless cache container under its old name; a stopped container left under that name (a Docker engine restart stops them all) made the create fail with a `409` name conflict, the group kept reporting the old container's address, and the log still said "respawned". A stopped container MiniStack's ElastiCache created under that name is now removed first, and a respawn that fails is logged as a failure naming the resource.
+
 ## [1.5.41] — 2026-11-14
 
 ### Added

@@ -301,8 +301,10 @@ def _ensure_live_containers_locked():
         try:
             engine = cl.get("Engine", "redis")
             version = cl.get("EngineVersion", "7.1")
+            container_name = f"ministack-elasticache-{account_id}-{region}-{name}"
+            _remove_stopped_leftover(container_name)
             host, port, cid = _spawn_redis_container(
-                name=f"ministack-elasticache-{account_id}-{region}-{name}",
+                name=container_name,
                 engine=engine, engine_version=version,
                 transit=cl.get("TransitEncryptionEnabled", False), auth_token=_record_auth(cl),
                 labels={
@@ -317,7 +319,12 @@ def _ensure_live_containers_locked():
                 node["Endpoint"] = {"Address": host, "Port": port}
             if cl.get("ConfigurationEndpoint"):
                 cl["ConfigurationEndpoint"] = {"Address": host, "Port": port}
-            log.info("elasticache: respawned container for cluster %s after restart", name)
+            if cid:
+                log.info("elasticache: respawned container for cluster %s after restart", name)
+            else:
+                log.warning(
+                    "elasticache: failed to respawn container for cluster %s on restart; "
+                    "endpoint will be unreachable", name)
         except Exception:
             log.warning(
                 "elasticache: failed to respawn container for cluster %s on restart; "
@@ -332,10 +339,13 @@ def _ensure_live_containers_locked():
             engine = rg.get("Engine", "redis")
             engine_version = rg.get("EngineVersion") or rg.get("CacheNodeType") or "7.1"
             node_groups = rg.get("NodeGroups") or []
+            failed = []
             for ng in node_groups:
                 ng_id = ng.get("NodeGroupId", "0001")
+                container_name = f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}"
+                _remove_stopped_leftover(container_name)
                 host, port, cid = _spawn_redis_container(
-                    name=f"ministack-elasticache-rg-{account_id}-{region}-{rg_id}-{ng_id}",
+                    name=container_name,
                     engine=engine, engine_version=engine_version,
                     transit=rg.get("TransitEncryptionEnabled", False), auth_token=_record_auth(rg),
                     acl=_engine_acl(rg, account_id, region),
@@ -354,7 +364,14 @@ def _ensure_live_containers_locked():
                         member["ReadEndpoint"] = dict(new)
                     if rg.get("ConfigurationEndpoint") == old:
                         rg["ConfigurationEndpoint"] = dict(new)
-            log.info("elasticache: respawned containers for replication group %s after restart", rg_id)
+                else:
+                    failed.append(ng_id)
+            if failed:
+                log.warning(
+                    "elasticache: failed to respawn node group(s) %s of replication group %s "
+                    "on restart; their endpoints will be unreachable", ", ".join(failed), rg_id)
+            else:
+                log.info("elasticache: respawned containers for replication group %s after restart", rg_id)
         except Exception:
             log.warning(
                 "elasticache: failed to respawn containers for replication group %s "
@@ -366,12 +383,45 @@ def _ensure_live_containers_locked():
         if cache is None or _get_docker() is None:
             continue
         try:
+            _remove_stopped_leftover(_serverless_container_name(account_id, region, name))
             _start_serverless_container(cache, account_id, region, wait=False)
             log.info("elasticache: respawned container for serverless cache %s after restart", name)
         except Exception:
             log.warning(
                 "elasticache: failed to respawn container for serverless cache %s on restart; "
                 "endpoint will be unreachable", name, exc_info=True)
+
+
+def _remove_stopped_leftover(name):
+    """Remove a stopped ElastiCache container still holding ``name``, so the
+    respawn that follows can create it again.
+
+    Restored state respawns each container under its old, deterministic name.
+    A container left behind under that name — stopped by a Docker engine
+    restart, say — makes ``containers.run`` fail with a 409 name conflict. The
+    boot sweep only reclaims containers labelled with this instance's address,
+    so one that carries another address (or that the sweep could not finish
+    removing) survives it.
+
+    Only a container MiniStack's ElastiCache created (its ``ministack`` label)
+    and that is not running is removed: a running one may be serving someone,
+    and the conflict it causes is reported by the spawn that follows.
+    ElastiCache nodes keep no data across a restart, so nothing is lost."""
+    docker_client = _get_docker()
+    if docker_client is None:
+        return
+    try:
+        container = docker_client.containers.get(name)
+    except Exception:
+        return  # none by that name (docker.errors.NotFound) or the daemon is unreachable
+    try:
+        labels = container.labels or {}
+        if labels.get("ministack") != "elasticache" or container.status == "running":
+            return
+        container.remove(force=True, v=True)
+        logger.info("ElastiCache: removed stopped container %s left from before the restart", name)
+    except Exception as exc:
+        logger.warning("ElastiCache: could not remove stopped container %s: %s", name, exc)
 
 
 # ── Seed default ElastiCache parameter groups ─────────────────

@@ -2855,6 +2855,170 @@ def test_elasticache_respawn_failure_is_logged_and_does_not_block_requests(monke
     assert any("failed to respawn" in r.message for r in caplog.records)
 
 
+class _FakeNotFound(Exception):
+    pass
+
+
+class _FakeContainer:
+    def __init__(self, docker, name, status, labels, ip):
+        self.docker, self.name, self.status, self.labels = docker, name, status, labels
+        self.id = f"cid-{name}-{len(docker.created)}"
+        self.attrs = {"NetworkSettings": {"Networks": {"respawn-net": {"IPAddress": ip}}}}
+        self.removed = False
+
+    def reload(self):
+        pass
+
+    def put_archive(self, path, data):
+        return True
+
+    def start(self):
+        self.status = "running"
+
+    def remove(self, force=False, v=False):
+        self.removed = True
+        self.docker.by_name.pop(self.name, None)
+
+
+class _FakeContainers:
+    """Enough of docker-py's ``containers`` for a respawn: a name is unique, as in Docker."""
+
+    def __init__(self, docker):
+        self.docker = docker
+
+    def get(self, name):
+        if name not in self.docker.by_name:
+            raise _FakeNotFound(name)
+        return self.docker.by_name[name]
+
+    def create(self, name, labels, **_):
+        if name in self.docker.by_name:
+            raise RuntimeError(f'409 Client Error: Conflict ("The container name "/{name}" is already in use")')
+        container = _FakeContainer(self.docker, name, "created", labels, f"172.30.0.{10 + len(self.docker.created)}")
+        self.docker.by_name[name] = container
+        self.docker.created.append(container)
+        return container
+
+    def run(self, **kwargs):
+        container = self.create(**kwargs)
+        container.start()
+        return container
+
+
+class _FakeDocker:
+    def __init__(self):
+        self.by_name, self.created = {}, []
+        self.containers = _FakeContainers(self)
+        self.images = types.SimpleNamespace(get=lambda image: image, pull=lambda image: image)
+
+    def leave(self, name, status, labels):
+        self.by_name[name] = _FakeContainer(self, name, status, labels, "172.30.0.4")
+        return self.by_name[name]
+
+
+def _restore_one_replication_group(_ec, rg_id="rg-left"):
+    old = {"Address": "172.30.0.4", "Port": 6379}
+    _ec.load_persisted_state({
+        "replication_groups": {
+            rg_id: {
+                "ReplicationGroupId": rg_id, "Engine": "valkey", "EngineVersion": "8.1",
+                "NodeGroups": [{"NodeGroupId": "0001", "PrimaryEndpoint": dict(old), "ReaderEndpoint": dict(old),
+                                "NodeGroupMembers": [{"CacheClusterId": f"{rg_id}-0001-001",
+                                                      "ReadEndpoint": dict(old)}]}],
+                "_docker_container_ids": ["dead-cid"],
+            },
+        },
+    })
+
+
+@pytest.fixture
+def respawn_docker(monkeypatch):
+    from ministack.core.responses import set_request_account_id
+    from ministack.services import elasticache as _ec
+    set_request_account_id("000000000000")
+    _ec.reset()
+    fake = _FakeDocker()
+    monkeypatch.setattr(_ec, "_get_docker", lambda: fake)
+    monkeypatch.setattr(_ec, "DOCKER_NETWORK", "respawn-net")
+    monkeypatch.setattr(_ec, "_next_host_port", lambda: 16379)
+    yield _ec, fake
+    _ec.reset()
+
+
+def test_elasticache_respawn_removes_a_stopped_container_left_under_the_same_name(respawn_docker, caplog):
+    """A Docker engine restart leaves the replication group's container stopped under its old
+    name. The respawn removes it and creates the container again, and the group reports the new
+    container's address instead of the old one, which Docker may have handed to another container."""
+    import logging
+
+    _ec, docker = respawn_docker
+    name = "ministack-elasticache-rg-000000000000-us-east-1-rg-left-0001"
+    left = docker.leave(name, "exited", {"ministack": "elasticache", "rg_id": "rg-left"})
+    _restore_one_replication_group(_ec)
+
+    with caplog.at_level(logging.INFO):
+        _ec._ensure_live_containers()
+
+    assert left.removed
+    assert [c.name for c in docker.created] == [name]
+    new = {"Address": docker.created[0].attrs["NetworkSettings"]["Networks"]["respawn-net"]["IPAddress"],
+           "Port": 6379}
+    assert new["Address"] != "172.30.0.4"
+    rg = _ec._replication_groups["rg-left"]
+    ng = rg["NodeGroups"][0]
+    assert ng["PrimaryEndpoint"] == ng["ReaderEndpoint"] == ng["NodeGroupMembers"][0]["ReadEndpoint"] == new
+    assert rg["_docker_container_ids"] == [docker.created[0].id]
+    assert any("respawned containers for replication group rg-left" in r.message for r in caplog.records)
+
+
+def test_elasticache_respawn_removes_a_stopped_cache_cluster_container(respawn_docker):
+    _ec, docker = respawn_docker
+    name = "ministack-elasticache-000000000000-us-east-1-c-left"
+    left = docker.leave(name, "exited", {"ministack": "elasticache", "cluster_id": "c-left"})
+    _ec.load_persisted_state({
+        "clusters": {
+            "c-left": {
+                "CacheClusterId": "c-left", "Engine": "valkey", "EngineVersion": "8.1",
+                "CacheNodes": [{"CacheNodeId": "0001", "Endpoint": {"Address": "172.30.0.4", "Port": 6379}}],
+                "_docker_container_id": "dead", "CacheClusterStatus": "available",
+            },
+        },
+    })
+
+    _ec._ensure_live_containers()
+
+    assert left.removed
+    cl = _ec._clusters["c-left"]
+    assert cl["_docker_container_id"] == docker.created[0].id
+    assert cl["CacheNodes"][0]["Endpoint"]["Address"] != "172.30.0.4"
+
+
+@pytest.mark.parametrize("status,labels", [
+    ("running", {"ministack": "elasticache"}),   # may be serving someone
+    ("exited", {"app": "not-ministack"}),        # not MiniStack's to remove
+])
+def test_elasticache_respawn_leaves_other_containers_and_says_the_respawn_failed(
+        respawn_docker, caplog, status, labels):
+    """A container MiniStack did not create, or one still running, is left alone. The spawn then
+    fails on the name, and the log says so instead of claiming the group was respawned."""
+    import logging
+
+    _ec, docker = respawn_docker
+    name = "ministack-elasticache-rg-000000000000-us-east-1-rg-left-0001"
+    left = docker.leave(name, status, labels)
+    _restore_one_replication_group(_ec)
+
+    with caplog.at_level(logging.INFO):
+        _ec._ensure_live_containers()
+
+    assert not left.removed and docker.created == []
+    messages = [r.message for r in caplog.records]
+    assert not any("respawned containers for replication group" in m for m in messages)
+    assert any("failed to respawn node group(s) 0001 of replication group rg-left" in m for m in messages)
+    # The failed spawn keeps its fallback contract: the endpoint is not rewritten.
+    assert _ec._replication_groups["rg-left"]["NodeGroups"][0]["PrimaryEndpoint"]["Address"] == "172.30.0.4"
+
+
 # ---------------------------------------------------------------------------
 # Valkey engine unit tests (engine -> image/port mapping, no-Docker fallback).
 # Folded from test_elasticache_valkey.py; no running server or Docker needed.
