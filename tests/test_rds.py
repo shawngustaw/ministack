@@ -18888,3 +18888,35 @@ def test_rds_aurora_postgresql_has_builtin_roles(rds):
     finally:
         rds.delete_db_instance(DBInstanceIdentifier=f"{cluster_id}-1", SkipFinalSnapshot=True)
         rds.delete_db_cluster(DBClusterIdentifier=cluster_id, SkipFinalSnapshot=True)
+
+
+class _CapturingContainers:
+    def __init__(self):
+        self.created = []
+
+    def create(self, **kwargs):
+        self.created.append(kwargs)
+
+        class _Started:
+            def put_archive(self, *_args):
+                return True
+
+            def start(self):
+                return None
+
+        return _Started()
+
+
+@pytest.mark.parametrize(
+    "engine, expected",
+    [("aurora-postgresql", True), ("postgres", False)],
+)
+def test_rds_aurora_postgresql_container_gets_auroras_max_connections(engine, expected):
+    """Aurora PostgreSQL sizes max_connections from instance memory; no class has the image's 100."""
+    containers = _CapturingContainers()
+    client = types.SimpleNamespace(containers=containers)
+    _imm_rds._run_rds_container(client, engine, {"image": "postgres:15-alpine", "name": "x"})
+    command = containers.created[0]["command"]
+    flag = f"max_connections={_imm_rds.AURORA_PG_MAX_CONNECTIONS}"
+    assert (flag in command) is expected
+    assert _imm_rds.AURORA_PG_MAX_CONNECTIONS > 100
