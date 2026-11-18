@@ -1,15 +1,15 @@
 # Builds Jump's patched MiniStack image (see JUMP.md) for linux/amd64 and
 # linux/arm64 and pushes it to this project's container registry.
 #
-# Runs on a tag named <upstream version>-jump.<n>, e.g. 1.5.41-jump.1, and
+# Runs on a tag named <upstream version>-jump.<n>, e.g. 1.5.42-jump.1, and
 # pushes $CI_REGISTRY_IMAGE:<tag> and $CI_REGISTRY_IMAGE:jump-latest.
 
 variables:
   # MiniStack's Dockerfile copies prebuilt MySQL plugins from its "full" image.
   # Upstream's release build uses the full image of the same release; this is
-  # 1.5.41-full, pinned by digest so a rebuild gets the same plugins. Update it
-  # when rebasing onto a new upstream release (JUMP.md).
-  PLUGIN_DONOR_IMAGE: ghcr.io/ministackorg/ministack@sha256:6cc353bd071cedef34718febeaac09b80b8e82c8cb0cb0caef44f7b4f87dfe56
+  # 1.5.42-full, pinned by digest so a rebuild gets the same plugins. Update it
+  # when merging a new upstream release (JUMP.md).
+  PLUGIN_DONOR_IMAGE: ghcr.io/ministackorg/ministack@sha256:d06118d640d3bbd6f4f51308bcaaa6bce5a21e6096279b067c2dd7c64f50599d
 
 build-image:
   image: registry.gitlab.com/theworkingname/jump/infra/docker-images/ci-docker:v29.0.0
