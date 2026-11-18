@@ -611,3 +611,26 @@ def test_unknown_shard_is_resource_not_found(ddb, ddb_streams):
         assert exc.value.response["Error"]["Message"] == "Requested resource not found: Shard does not exist"
     finally:
         ddb.delete_table(TableName=name)
+
+
+def test_stream_positions_carry_on_across_a_restart(streams_state):
+    """Stream records are not persisted, but the positions consumers hold are:
+    a restored stream continues from the old end, so a consumer that had read
+    everything reads the next record instead of waiting for the new stream to
+    catch up with its saved position."""
+    ddb_service, _streams, time = streams_state
+    _streamed_table(ddb_service, "restart-positions")
+    now = time.time()
+    ddb_service._stream_records["restart-positions"] = [_record(i, now) for i in range(5)]
+    end_before = ddb_service.stream_end_position("restart-positions")
+    assert end_before == 5
+
+    saved = ddb_service.get_state()
+    ddb_service._stream_records._data.clear()
+    ddb_service._stream_trimmed._data.clear()
+    ddb_service.load_persisted_state(saved)
+
+    assert ddb_service.stream_end_position("restart-positions") == end_before
+    ddb_service._stream_records["restart-positions"] = [_record(5, now)]
+    assert ddb_service.stream_end_position("restart-positions") == end_before + 1
+    assert ddb_service.stream_records_since("restart-positions", end_before, 10)[0]["eventID"] == "5"

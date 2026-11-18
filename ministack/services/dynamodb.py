@@ -134,7 +134,24 @@ def get_state():
         "resource_policies": copy.deepcopy(_resource_policies),
         "exports": copy.deepcopy(_exports),
         "imports": copy.deepcopy(_imports),
+        "stream_ends": _stream_end_positions(),
     }
+
+
+def _stream_end_positions():
+    """Each table stream's absolute end position. Stream records are not
+    persisted, but the positions mapping and pipe consumers hold are: a
+    restored stream continues from here, so a consumer at the old end reads
+    the next record instead of waiting for the new stream to catch up."""
+    ends = AccountRegionScopedDict()
+    keys = {key for key, _ in _stream_records.all_items()} | {key for key, _ in _stream_trimmed.all_items()}
+    for account_id, region, table_name in keys:
+        ends.set_scoped(
+            account_id, region, table_name,
+            _trimmed_count(table_name, account_id, region)
+            + len(_live_stream_records(table_name, account_id, region)),
+        )
+    return ends
 
 
 def _table_name_from_metadata_key(key) -> str:
@@ -230,6 +247,8 @@ def _restore_state(data):
         _resource_policies.update(data.get("resource_policies", {}))
         _exports.update(data.get("exports", {}))
         _imports.update(data.get("imports", {}))
+        # The records themselves are gone; their positions carry on (see _stream_end_positions).
+        _stream_trimmed.update(data.get("stream_ends", {}))
         # No worker on this side of the restart; DescribeImport closes it out.
         for _desc in _imports._data.values():
             if isinstance(_desc, dict) and _desc.get("ImportStatus") == "IN_PROGRESS":
