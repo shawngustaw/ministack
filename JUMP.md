@@ -27,6 +27,7 @@ Based on upstream release **1.5.41** (`837b11b5`).
 | `fix(lambda): honour MaximumRetryAttempts on stream mappings` | A failing Kinesis or DynamoDB stream batch is retried forever and blocks its shard (availability's offer consumer stopped on one bad offer). | Stream ESM MaximumRetryAttempts (to be filed) |
 | `fix(dynamodb): stream positions carry on across a restart` | After a MiniStack restart, stream mappings and pipes wait for the unpersisted stream to catch up with their saved positions: reservation-lock events stop. | DynamoDB stream positions after restart (to be filed) |
 | `fix(cognito): ClientMetadata and ValidationData in the PreSignUp event` | `SignUp`'s PreSignUp event has an empty `validationData` and no `clientMetadata`. | PreSignUp clientMetadata (to be filed) |
+| `feat(cognito): fire PreSignUp on AdminCreateUser` | `AdminCreateUser` never invokes PreSignUp, so pro-api-graphql's sign-up (`adminSignUp` with the org in `ClientMetadata`) creates no pro-account row and the user's token gets no `jump:*` claims. | PreSignUp on AdminCreateUser (to be filed) |
 | `ci: build Jump's image on GitLab` | This file and `.gitlab-ci.yml`. Jump only. | none |
 
 Fill in the issue links once they are filed. When upstream fixes one, drop its commit at the

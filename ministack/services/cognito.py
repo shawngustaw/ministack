@@ -4856,6 +4856,25 @@ def _admin_create_user(data):
         real_username = attr_dict["sub"]
     else:
         real_username = username
+
+    # AdminCreateUser fires the pool's PreSignUp Lambda (PreSignUp_AdminCreateUser)
+    # with the call's ClientMetadata, before the user is persisted: a rejecting or
+    # failing trigger fails the call and leaves no user behind. Its autoVerify*
+    # answers apply; the user stays FORCE_CHANGE_PASSWORD whatever autoConfirmUser says.
+    try:
+        presignup = _apply_presignup_trigger(
+            pid, _CLIENT_ID_NOT_APPLICABLE, real_username, dict(attr_dict),
+            trigger_source="PreSignUp_AdminCreateUser",
+            client_metadata=data.get("ClientMetadata"),
+            validation_data=_attr_list_to_dict(data.get("ValidationData") or []),
+        )
+    except _PreSignUpRejected as e:
+        logger.info("Cognito: PreSignUp Lambda rejected AdminCreateUser for %s: %s", real_username, e)
+        return error_response_json("UserLambdaValidationException", str(e), 400)
+    if presignup["autoVerifyEmail"] and "email" in attr_dict:
+        attr_dict["email_verified"] = "true"
+    if presignup["autoVerifyPhone"] and "phone_number" in attr_dict:
+        attr_dict["phone_number_verified"] = "true"
     attrs = _dict_to_attr_list(attr_dict)
 
     # Rendered before the user is persisted: a failing CustomMessage Lambda
