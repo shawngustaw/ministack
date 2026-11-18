@@ -11789,6 +11789,34 @@ def test_cognito_presignup_event_username_is_sub_in_username_attributes_pool(cog
     lam.delete_function(FunctionName=fn_arn.rsplit(":", 1)[-1])
 
 
+def test_cognito_presignup_signup_event_carries_client_metadata_and_validation_data(cognito_idp, lam):
+    """SignUp's ClientMetadata and ValidationData reach the PreSignUp Lambda's request."""
+    fname = f"presignup-meta-{_uuid_mod.uuid4().hex[:8]}"
+    fn_arn = _create_lambda(lam, fname, (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    r = event['request']\n"
+        "    raise Exception('seen=' + json.dumps([r.get('clientMetadata'), r['validationData']], sort_keys=True))\n"
+    ))
+    pid = cognito_idp.create_user_pool(
+        PoolName="PreSignUpMetadata", LambdaConfig={"PreSignUp": fn_arn})["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(UserPoolId=pid, ClientName="c")["UserPoolClient"]["ClientId"]
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.sign_up(
+            ClientId=cid, Username="meta", Password="Passw0rd!x",
+            ClientMetadata={"orgId": "42"},
+            ValidationData=[{"Name": "invite", "Value": "abc"}])
+    assert 'seen=[{"orgId": "42"}, {"invite": "abc"}]' in exc.value.response["Error"]["Message"]
+
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.sign_up(ClientId=cid, Username="bare", Password="Passw0rd!x")
+    assert "seen=[null, {}]" in exc.value.response["Error"]["Message"]
+
+    cognito_idp.delete_user_pool(UserPoolId=pid)
+    lam.delete_function(FunctionName=fname)
+
+
 def test_cognito_discovery_document_is_self_consistent_at_the_issuer_host():
     """OIDC discovery requires the document's issuer to equal the URL it was
     fetched from. Routing the AWS hostname to MiniStack satisfies that, and

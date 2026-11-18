@@ -1286,7 +1286,9 @@ class _PreSignUpRejected(Exception):
 
 def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
                               user_attrs: dict,
-                              trigger_source: str = "PreSignUp_ExternalProvider") -> dict:
+                              trigger_source: str = "PreSignUp_ExternalProvider",
+                              client_metadata: dict | None = None,
+                              validation_data: dict | None = None) -> dict:
     """Invoke the user pool's PreSignUp Lambda before persisting a federated user.
 
     Emulates AWS's ``PreSignUp_ExternalProvider`` trigger, which fires
@@ -1313,6 +1315,7 @@ def _apply_presignup_trigger(pool_id: str, client_id: str, username: str,
     event = _build_presignup_event(
         pool_id=pool_id, client_id=client_id, username=username,
         user_attrs=user_attrs, trigger_source=trigger_source,
+        client_metadata=client_metadata, validation_data=validation_data,
     )
 
     try:
@@ -1433,15 +1436,18 @@ def _apply_inbound_federation_trigger(pool_id: str, client_id: str, username: st
 
 
 def _build_presignup_event(pool_id: str, client_id: str, username: str,
-                            user_attrs: dict, trigger_source: str) -> dict:
+                            user_attrs: dict, trigger_source: str,
+                            client_metadata: dict | None = None,
+                            validation_data: dict | None = None) -> dict:
     """Construct the event payload AWS sends to a PreSignUp Lambda.
 
     Shape from the Cognito Developer Guide
     (https://docs.aws.amazon.com/cognito/latest/developerguide/user-pool-lambda-pre-sign-up.html).
-    ``validationData`` is always empty for federated sign-in — it only carries
-    data supplied via ``ClientMetadata`` on the native ``SignUp`` API.
+    ``validationData`` carries the ``ValidationData`` of ``SignUp`` or
+    ``AdminCreateUser`` (empty for federated sign-in), and ``clientMetadata``
+    the call's ``ClientMetadata``, present only when the call passed some.
     """
-    return {
+    event = {
         "version": "1",
         "triggerSource": trigger_source,
         "region": _pool_region(pool_id),
@@ -1454,7 +1460,7 @@ def _build_presignup_event(pool_id: str, client_id: str, username: str,
         "request": {
             "userAttributes": {k: v for k, v in (user_attrs or {}).items()
                                if isinstance(v, (str, int, float, bool))},
-            "validationData": {},
+            "validationData": dict(validation_data or {}),
         },
         "response": {
             "autoConfirmUser": False,
@@ -1462,6 +1468,9 @@ def _build_presignup_event(pool_id: str, client_id: str, username: str,
             "autoVerifyPhone": False,
         },
     }
+    if client_metadata:
+        event["request"]["clientMetadata"] = dict(client_metadata)
+    return event
 
 
 def _token_claims(token) -> dict:
@@ -6346,6 +6355,8 @@ def _sign_up(data):
         presignup = _apply_presignup_trigger(
             pid, cid, username, dict(attr_dict),
             trigger_source="PreSignUp_SignUp",
+            client_metadata=data.get("ClientMetadata"),
+            validation_data=_attr_list_to_dict(data.get("ValidationData") or []),
         )
     except _PreSignUpRejected as e:
         logger.info("Cognito: PreSignUp Lambda rejected sign-up for %s: %s", username, e)
