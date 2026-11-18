@@ -6075,6 +6075,7 @@ def esm_poll_state(tmp_path, monkeypatch):
         lsvc._kinesis_positions._data.clear()
         lsvc._dynamodb_stream_positions._data.clear()
         lsvc._esm_backoff_until._data.clear()
+        lsvc._esm_batch_failures._data.clear()
         lsvc._esm_inflight.clear()
         _sqs._queues._data.clear()
         _kin._streams._data.clear()
@@ -6543,6 +6544,102 @@ def test_poll_kinesis_returns_false_when_invoke_fails(esm_poll_state, monkeypatc
     assert _lsvc._poll_kinesis() is False
     # Position didn't advance, so a second pass sees the exact same batch.
     assert _lsvc._poll_kinesis() is False
+
+
+def test_poll_kinesis_discards_a_batch_after_maximum_retry_attempts(esm_poll_state, monkeypatch):
+    """After MaximumRetryAttempts retries a failing batch is discarded: its batch
+    info goes to the OnFailure destination and the shard moves past it, so one
+    poison record cannot hold every record behind it."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    stream_name = "esm-kinesis-retry-limit"
+    stream_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    function_name = "esm-kinesis-retry-limit-fn"
+    dlq_name = "esm-kinesis-retry-limit-dlq"
+    dlq_arn = f"arn:aws:sqs:us-east-1:000000000000:{dlq_name}"
+    _sqs._queues[_sqs._queue_url(dlq_name)] = {
+        "name": dlq_name,
+        "messages": [],
+        "attributes": {"QueueArn": dlq_arn},
+        "is_fifo": False,
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    _lsvc._functions[function_name] = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _kin._streams[stream_name] = _kinesis_stream_record(stream_name, stream_arn)
+    _lsvc._esms["esm-kinesis-retry-limit"] = {
+        "UUID": "esm-kinesis-retry-limit",
+        "EventSourceArn": stream_arn,
+        "FunctionName": function_name,
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+        "StartingPosition": "TRIM_HORIZON",
+        "MaximumRetryAttempts": 1,
+        "DestinationConfig": {"OnFailure": {"Destination": dlq_arn}},
+    }
+    invokes = []
+
+    def failing(_func, event):
+        invokes.append(event)
+        return {"error": True, "body": {"errorType": "TypeError", "errorMessage": "boom"}}
+
+    monkeypatch.setattr(_lsvc, "_execute_function", failing)
+
+    assert _lsvc._poll_kinesis() is False  # the first invocation
+    _lsvc._esm_backoff_until._data.clear()
+    assert _lsvc._poll_kinesis() is True  # its one retry fails too: discarded
+    _lsvc._esm_backoff_until._data.clear()
+    assert _lsvc._poll_kinesis() is False  # nothing left to read
+    assert len(invokes) == 2
+
+    messages = _sqs._queues[_sqs._queue_url(dlq_name)]["messages"]
+    assert len(messages) == 1
+    record = json.loads(messages[0]["body"])
+    assert record["requestContext"]["condition"] == "RetryAttemptsExhausted"
+    assert record["KinesisBatchInfo"]["streamArn"] == stream_arn
+    assert record["KinesisBatchInfo"]["batchSize"] == 1
+
+
+def test_poll_kinesis_retries_forever_without_maximum_retry_attempts(esm_poll_state, monkeypatch):
+    """-1 (the API's default) or no limit: a failing batch stays, as on AWS until the records expire."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+    stream_name = "esm-kinesis-no-retry-limit"
+    stream_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    function_name = "esm-kinesis-no-retry-limit-fn"
+    _lsvc._functions[function_name] = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _kin._streams[stream_name] = _kinesis_stream_record(stream_name, stream_arn)
+    _lsvc._esms["esm-kinesis-no-retry-limit"] = {
+        "UUID": "esm-kinesis-no-retry-limit",
+        "EventSourceArn": stream_arn,
+        "FunctionName": function_name,
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+        "StartingPosition": "TRIM_HORIZON",
+        "MaximumRetryAttempts": -1,
+    }
+    monkeypatch.setattr(
+        _lsvc, "_execute_function",
+        lambda _func, _event: {"error": True, "body": {"errorType": "Error", "errorMessage": "boom"}},
+    )
+    for _ in range(5):
+        assert _lsvc._poll_kinesis() is False
+        _lsvc._esm_backoff_until._data.clear()
 
 
 def test_poll_dynamodb_streams_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):

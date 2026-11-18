@@ -24,6 +24,7 @@ Based on upstream release **1.5.41** (`837b11b5`).
 | `feat(pipes): apply TargetParameters.InputTemplate` | Pipes deliver the raw record, ignoring the input template. | Pipes FilterCriteria and InputTemplate (to be filed) |
 | `feat(eventbridge): deliver to Kinesis stream targets` | A rule targeting a Kinesis stream logs "unsupported target type" and delivers nothing (pro-event-bridge's offers go to the pro-offer stream this way). | EventBridge Kinesis targets (to be filed) |
 | `fix(rds): Aurora PostgreSQL max_connections as Aurora sizes it` | Aurora PostgreSQL containers get the image's 100 connections; platform-availability's warm Lambda pools exhaust them. | Aurora max_connections (to be filed) |
+| `fix(lambda): honour MaximumRetryAttempts on stream mappings` | A failing Kinesis or DynamoDB stream batch is retried forever and blocks its shard (availability's offer consumer stopped on one bad offer). | Stream ESM MaximumRetryAttempts (to be filed) |
 | `ci: build Jump's image on GitLab` | This file and `.gitlab-ci.yml`. Jump only. | none |
 
 Fill in the issue links once they are filed. When upstream fixes one, drop its commit at the
