@@ -11870,6 +11870,86 @@ def test_cognito_presignup_trigger_fires_on_admin_create_user(cognito_idp, lam):
     lam.delete_function(FunctionName=fname)
 
 
+def test_cognito_postconfirmation_trigger_fires_on_each_confirmation(cognito_idp, lam):
+    """The pool's PostConfirmation Lambda runs once a user is confirmed: by
+    ConfirmSignUp, AdminConfirmSignUp, an admin-created user's first password
+    (NEW_PASSWORD_REQUIRED) and ConfirmForgotPassword. A failing trigger fails
+    the call with UserLambdaValidationException; the confirmation stands."""
+    import json as _json
+
+    fname = f"postconfirm-{_uuid_mod.uuid4().hex[:8]}"
+    fn_arn = _create_lambda(lam, fname, (
+        "import json\n"
+        "def handler(event, context):\n"
+        "    if event['userName'].startswith('ok'):\n"
+        "        return event\n"
+        "    r = event['request']\n"
+        "    raise Exception('seen=' + json.dumps([event['triggerSource'],\n"
+        "        event['callerContext']['clientId'], event['userName'],\n"
+        "        r['userAttributes'].get('cognito:user_status'), r.get('clientMetadata')]))\n"
+    ))
+    pid = cognito_idp.create_user_pool(
+        PoolName="PostConfirmation", LambdaConfig={"PostConfirmation": fn_arn})["UserPool"]["Id"]
+    cid = cognito_idp.create_user_pool_client(
+        UserPoolId=pid, ClientName="c",
+        ExplicitAuthFlows=["ALLOW_USER_PASSWORD_AUTH", "ALLOW_REFRESH_TOKEN_AUTH"],
+    )["UserPoolClient"]["ClientId"]
+
+    def seen(exc):
+        assert exc.value.response["Error"]["Code"] == "UserLambdaValidationException"
+        message = exc.value.response["Error"]["Message"]
+        assert message.startswith("PostConfirmation failed with error seen=")
+        return _json.loads(message.split("seen=", 1)[1].rsplit(".", 1)[0])
+
+    def status(username):
+        return cognito_idp.admin_get_user(UserPoolId=pid, Username=username)["UserStatus"]
+
+    cognito_idp.sign_up(ClientId=cid, Username="ok-user", Password="Passw0rd!x")
+    cognito_idp.confirm_sign_up(ClientId=cid, Username="ok-user", ConfirmationCode="123456")
+    assert status("ok-user") == "CONFIRMED"
+
+    cognito_idp.sign_up(ClientId=cid, Username="self", Password="Passw0rd!x")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.confirm_sign_up(ClientId=cid, Username="self", ConfirmationCode="123456",
+                                    ClientMetadata={"k": "v"})
+    assert seen(exc) == ["PostConfirmation_ConfirmSignUp", cid, "self", "CONFIRMED", {"k": "v"}]
+    assert status("self") == "CONFIRMED"
+
+    cognito_idp.sign_up(ClientId=cid, Username="admin", Password="Passw0rd!x")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.admin_confirm_sign_up(UserPoolId=pid, Username="admin")
+    assert seen(exc) == ["PostConfirmation_ConfirmSignUp", "CLIENT_ID_NOT_APPLICABLE", "admin", "CONFIRMED", None]
+    assert status("admin") == "CONFIRMED"
+
+    cognito_idp.admin_create_user(UserPoolId=pid, Username="invited",
+                                  TemporaryPassword="Temp0rary!x", MessageAction="SUPPRESS")
+    challenge = cognito_idp.initiate_auth(
+        ClientId=cid, AuthFlow="USER_PASSWORD_AUTH",
+        AuthParameters={"USERNAME": "invited", "PASSWORD": "Temp0rary!x"})
+    assert challenge["ChallengeName"] == "NEW_PASSWORD_REQUIRED"
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.respond_to_auth_challenge(
+            ClientId=cid, ChallengeName="NEW_PASSWORD_REQUIRED", Session=challenge["Session"],
+            ChallengeResponses={"USERNAME": "invited", "NEW_PASSWORD": "Passw0rd!x"})
+    assert seen(exc) == ["PostConfirmation_ConfirmSignUp", cid, "invited", "CONFIRMED", None]
+    assert status("invited") == "CONFIRMED"
+
+    cognito_idp.admin_create_user(
+        UserPoolId=pid, Username="forgot", MessageAction="SUPPRESS",
+        UserAttributes=[{"Name": "email", "Value": "forgot@example.com"},
+                        {"Name": "email_verified", "Value": "true"}])
+    cognito_idp.admin_set_user_password(UserPoolId=pid, Username="forgot",
+                                        Password="Passw0rd!x", Permanent=True)
+    cognito_idp.forgot_password(ClientId=cid, Username="forgot")
+    with pytest.raises(ClientError) as exc:
+        cognito_idp.confirm_forgot_password(ClientId=cid, Username="forgot",
+                                            ConfirmationCode="654321", Password="N3wPassw0rd!x")
+    assert seen(exc) == ["PostConfirmation_ConfirmForgotPassword", cid, "forgot", "CONFIRMED", None]
+
+    cognito_idp.delete_user_pool(UserPoolId=pid)
+    lam.delete_function(FunctionName=fname)
+
+
 def test_cognito_discovery_document_is_self_consistent_at_the_issuer_host():
     """OIDC discovery requires the document's issuer to equal the URL it was
     fetched from. Routing the AWS hostname to MiniStack satisfies that, and

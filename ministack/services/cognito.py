@@ -5028,7 +5028,8 @@ def _admin_confirm_sign_up(data):
         return err
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
-    return json_response({})
+    return _confirmed(pid, _CLIENT_ID_NOT_APPLICABLE, user, "PostConfirmation_ConfirmSignUp",
+                      data.get("ClientMetadata"))
 
 
 def _admin_disable_user(data):
@@ -5419,6 +5420,64 @@ def _mfa_challenge_for_user(pool: dict, user: dict, pid: str, username: str) -> 
 
 class _PostAuthenticationInvalid(Exception):
     """Raised when a PostAuthentication Lambda does not return the event."""
+
+
+def _apply_postconfirmation_trigger(pool_id: str, client_id: str, user: dict, trigger_source: str,
+                                    client_metadata: dict | None = None):
+    """Invoke the pool's PostConfirmation Lambda once a user is confirmed.
+
+    ``trigger_source`` is ``PostConfirmation_ConfirmSignUp`` (ConfirmSignUp,
+    AdminConfirmSignUp, and an admin-created user's first password through
+    NEW_PASSWORD_REQUIRED) or ``PostConfirmation_ConfirmForgotPassword``. A
+    trigger that fails raises ``_PreTokenRejected`` and one that cannot be invoked
+    ``_PreTokenUnavailable``, for the caller to answer with ``_pretoken_error``;
+    the confirmation itself stands.
+    """
+    pool = _user_pools.get(pool_id)
+    arn = ((pool or {}).get("LambdaConfig") or {}).get("PostConfirmation")
+    if not arn:
+        return
+    attrs = {k: v for k, v in _attr_list_to_dict(user.get("Attributes", [])).items()
+             if isinstance(v, (str, int, float, bool))}
+    attrs["cognito:user_status"] = user.get("UserStatus", "CONFIRMED")
+    request = {"userAttributes": attrs}
+    if client_metadata:
+        request["clientMetadata"] = dict(client_metadata)
+    event = {
+        "version": "1",
+        "triggerSource": trigger_source,
+        "region": _pool_region(pool_id),
+        "userPoolId": pool_id,
+        "userName": user.get("Username", ""),
+        "callerContext": {"awsSdkVersion": "aws-sdk-unknown-unknown", "clientId": client_id or ""},
+        "request": request,
+        "response": {},
+    }
+    try:
+        # Lazy import to avoid a circular dependency between cognito and lambda_svc.
+        from ministack.services import lambda_svc
+        record, config, _name = lambda_svc._get_func_record_for_ref(arn)
+        if record is None or config is None:
+            raise _PreTokenUnavailable("PostConfirmation invocation failed due to error AccessDeniedException.")
+        exec_record = lambda_svc._execution_record_for_config(record, config)
+        result = lambda_svc._execute_function_with_config_scope(exec_record, event)
+    except Exception as e:
+        logger.warning("PostConfirmation Lambda invocation failed for pool %s: %s", pool_id, e)
+        if isinstance(e, _PreTokenUnavailable):
+            raise
+        raise _PreTokenUnavailable(
+            f"PostConfirmation invocation failed due to error {type(e).__name__}.") from e
+    if isinstance(result, dict) and result.get("error"):
+        raise _PreTokenRejected(f"PostConfirmation failed with error {_lambda_error_message(result.get('body'))}.")
+
+
+def _confirmed(pool_id: str, client_id: str, user: dict, trigger_source: str, client_metadata=None):
+    """The response for a call that has just confirmed ``user``, after its PostConfirmation trigger."""
+    try:
+        _apply_postconfirmation_trigger(pool_id, client_id, user, trigger_source, client_metadata)
+    except (_PreTokenRejected, _PreTokenUnavailable) as e:
+        return _pretoken_error(e)
+    return json_response({})
 
 
 def _apply_postauth_trigger(pool_id: str, client_id: str, user: dict, client_metadata: dict | None,
@@ -5840,9 +5899,16 @@ def _admin_respond_to_auth_challenge(data):
             return refused
         if new_password:
             user["_password"] = new_password
+        first_password = user.get("UserStatus") == "FORCE_CHANGE_PASSWORD"
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
         _record_auth_event(pool, user, data, "PasswordChange", "Pass")
+        if first_password:
+            # An admin-created user's first password confirms the account (PostConfirmation_ConfirmSignUp).
+            try:
+                _apply_postconfirmation_trigger(pid, cid, user, "PostConfirmation_ConfirmSignUp", client_metadata)
+            except (_PreTokenRejected, _PreTokenUnavailable) as e:
+                return _pretoken_error(e)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, trigger_source="TokenGeneration_NewPasswordChallenge",
             client_metadata=client_metadata)})
@@ -6233,9 +6299,16 @@ def _respond_to_auth_challenge(data):
             return refused
         if new_password:
             user["_password"] = new_password
+        first_password = user.get("UserStatus") == "FORCE_CHANGE_PASSWORD"
         user["UserStatus"] = "CONFIRMED"
         user["UserLastModifiedDate"] = _now_epoch()
         _record_auth_event(pool, user, data, "PasswordChange", "Pass")
+        if first_password:
+            # An admin-created user's first password confirms the account (PostConfirmation_ConfirmSignUp).
+            try:
+                _apply_postconfirmation_trigger(pid, cid, user, "PostConfirmation_ConfirmSignUp", client_metadata)
+            except (_PreTokenRejected, _PreTokenUnavailable) as e:
+                return _pretoken_error(e)
         return json_response({"AuthenticationResult": _build_auth_result(
             pid, cid, user, trigger_source="TokenGeneration_NewPasswordChallenge",
             client_metadata=client_metadata)})
@@ -6488,7 +6561,8 @@ def _confirm_sign_up(data):
         user["Attributes"] = _merge_attributes(user.get("Attributes", []), [{"Name": f"{attribute}_verified", "Value": "true"}])
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
-    return json_response({})
+    return _confirmed(_pool_for_client(cid)[1], cid, user, "PostConfirmation_ConfirmSignUp",
+                      data.get("ClientMetadata"))
 
 
 def _forgot_password(data):
@@ -6557,7 +6631,8 @@ def _confirm_forgot_password(data):
     user["_password"] = new_password
     user["UserStatus"] = "CONFIRMED"
     user["UserLastModifiedDate"] = _now_epoch()
-    return json_response({})
+    return _confirmed(_pool_for_client(cid)[1], cid, user, "PostConfirmation_ConfirmForgotPassword",
+                      data.get("ClientMetadata"))
 
 
 def _user_pool_for_access_token(access_token):
