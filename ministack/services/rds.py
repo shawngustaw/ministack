@@ -94,6 +94,12 @@ _DOCKER_TIMEOUT = float(os.environ.get("MINISTACK_DOCKER_TIMEOUT", "10"))
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 _MINISTACK_HOST = os.environ.get("MINISTACK_HOST", "localhost")
 BASE_PORT = int(os.environ.get("RDS_BASE_PORT", "15432"))
+# Aurora PostgreSQL sizes max_connections from the instance's memory,
+# LEAST({DBInstanceClassMemory/9531392}, 5000): 1,660 on a 16 GiB
+# db.r6g.large, 5,000 on a db.serverless near its top ACU. No Aurora class gets
+# the image's 100, which a few concurrently warm Lambda pools exhaust. A fixed
+# value stands in for the formula; RDS_AURORA_PG_MAX_CONNECTIONS overrides it.
+AURORA_PG_MAX_CONNECTIONS = int(os.environ.get("RDS_AURORA_PG_MAX_CONNECTIONS", "2000"))
 RDS_TMPFS_SIZE = os.environ.get("RDS_TMPFS_SIZE", "256m")
 RDS_PERSIST = os.environ.get("RDS_PERSIST", "0").lower() in ("1", "true", "yes")
 DOCKER_NETWORK = os.environ.get("DOCKER_NETWORK", "")
@@ -1376,6 +1382,8 @@ def _run_rds_container(docker_client, engine, container_kwargs, tls_names=(), tl
         command += ["-c", "ssl=on",
                     "-c", f"ssl_cert_file={_PG_TLS_DIR}/server.crt",
                     "-c", f"ssl_key_file={_PG_TLS_DIR}/server.key"]
+        if engine == "aurora-postgresql":
+            command += ["-c", f"max_connections={AURORA_PG_MAX_CONNECTIONS}"]
         entrypoint = kwargs.get("entrypoint") or ["docker-entrypoint.sh"]
         if isinstance(entrypoint, str):
             entrypoint = [entrypoint]

@@ -6075,6 +6075,7 @@ def esm_poll_state(tmp_path, monkeypatch):
         lsvc._kinesis_positions._data.clear()
         lsvc._dynamodb_stream_positions._data.clear()
         lsvc._esm_backoff_until._data.clear()
+        lsvc._esm_batch_failures._data.clear()
         lsvc._esm_inflight.clear()
         _sqs._queues._data.clear()
         _kin._streams._data.clear()
@@ -6543,6 +6544,102 @@ def test_poll_kinesis_returns_false_when_invoke_fails(esm_poll_state, monkeypatc
     assert _lsvc._poll_kinesis() is False
     # Position didn't advance, so a second pass sees the exact same batch.
     assert _lsvc._poll_kinesis() is False
+
+
+def test_poll_kinesis_discards_a_batch_after_maximum_retry_attempts(esm_poll_state, monkeypatch):
+    """After MaximumRetryAttempts retries a failing batch is discarded: its batch
+    info goes to the OnFailure destination and the shard moves past it, so one
+    poison record cannot hold every record behind it."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+
+    stream_name = "esm-kinesis-retry-limit"
+    stream_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    function_name = "esm-kinesis-retry-limit-fn"
+    dlq_name = "esm-kinesis-retry-limit-dlq"
+    dlq_arn = f"arn:aws:sqs:us-east-1:000000000000:{dlq_name}"
+    _sqs._queues[_sqs._queue_url(dlq_name)] = {
+        "name": dlq_name,
+        "messages": [],
+        "attributes": {"QueueArn": dlq_arn},
+        "is_fifo": False,
+        "dedup_cache": {},
+        "fifo_seq": 0,
+    }
+    _lsvc._functions[function_name] = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _kin._streams[stream_name] = _kinesis_stream_record(stream_name, stream_arn)
+    _lsvc._esms["esm-kinesis-retry-limit"] = {
+        "UUID": "esm-kinesis-retry-limit",
+        "EventSourceArn": stream_arn,
+        "FunctionName": function_name,
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+        "StartingPosition": "TRIM_HORIZON",
+        "MaximumRetryAttempts": 1,
+        "DestinationConfig": {"OnFailure": {"Destination": dlq_arn}},
+    }
+    invokes = []
+
+    def failing(_func, event):
+        invokes.append(event)
+        return {"error": True, "body": {"errorType": "TypeError", "errorMessage": "boom"}}
+
+    monkeypatch.setattr(_lsvc, "_execute_function", failing)
+
+    assert _lsvc._poll_kinesis() is False  # the first invocation
+    _lsvc._esm_backoff_until._data.clear()
+    assert _lsvc._poll_kinesis() is True  # its one retry fails too: discarded
+    _lsvc._esm_backoff_until._data.clear()
+    assert _lsvc._poll_kinesis() is False  # nothing left to read
+    assert len(invokes) == 2
+
+    messages = _sqs._queues[_sqs._queue_url(dlq_name)]["messages"]
+    assert len(messages) == 1
+    record = json.loads(messages[0]["body"])
+    assert record["requestContext"]["condition"] == "RetryAttemptsExhausted"
+    assert record["KinesisBatchInfo"]["streamArn"] == stream_arn
+    assert record["KinesisBatchInfo"]["batchSize"] == 1
+
+
+def test_poll_kinesis_retries_forever_without_maximum_retry_attempts(esm_poll_state, monkeypatch):
+    """-1 (the API's default) or no limit: a failing batch stays, as on AWS until the records expire."""
+    _lsvc, _sqs, _kin, _ddb = esm_poll_state
+    stream_name = "esm-kinesis-no-retry-limit"
+    stream_arn = f"arn:aws:kinesis:us-east-1:000000000000:stream/{stream_name}"
+    function_name = "esm-kinesis-no-retry-limit-fn"
+    _lsvc._functions[function_name] = {
+        "config": {
+            "FunctionName": function_name,
+            "FunctionArn": f"arn:aws:lambda:us-east-1:000000000000:function:{function_name}",
+        },
+        "versions": {},
+        "aliases": {},
+    }
+    _kin._streams[stream_name] = _kinesis_stream_record(stream_name, stream_arn)
+    _lsvc._esms["esm-kinesis-no-retry-limit"] = {
+        "UUID": "esm-kinesis-no-retry-limit",
+        "EventSourceArn": stream_arn,
+        "FunctionName": function_name,
+        "State": "Enabled",
+        "Enabled": True,
+        "BatchSize": 10,
+        "StartingPosition": "TRIM_HORIZON",
+        "MaximumRetryAttempts": -1,
+    }
+    monkeypatch.setattr(
+        _lsvc, "_execute_function",
+        lambda _func, _event: {"error": True, "body": {"errorType": "Error", "errorMessage": "boom"}},
+    )
+    for _ in range(5):
+        assert _lsvc._poll_kinesis() is False
+        _lsvc._esm_backoff_until._data.clear()
 
 
 def test_poll_dynamodb_streams_returns_false_when_invoke_fails(esm_poll_state, monkeypatch):
@@ -7676,6 +7773,59 @@ def test_match_esm_filter_content_prefix_suffix_anything_but():
     assert lsvc._match_esm_filter(rec, {"body": {"name": [{"anything-but": ["other"]}]}}) is True
     assert lsvc._match_esm_filter(rec, {"body": {"missing": [{"exists": False}]}}) is True
     assert lsvc._match_esm_filter(rec, {"body": {"name": [{"exists": True}]}}) is True
+
+
+def test_match_esm_filter_equals_ignore_case():
+    """equals-ignore-case matches a string value whatever its case (AWS Lambda event filtering docs)."""
+    pat = {"eventName": [{"equals-ignore-case": "MODIFY"}]}
+    for value in ("MODIFY", "modify", "Modify"):
+        assert lsvc._match_esm_filter({"eventName": value}, pat) is True
+    assert lsvc._match_esm_filter({"eventName": "INSERT"}, pat) is False
+    assert lsvc._match_esm_filter({"eventName": 1}, pat) is False, "only a string can match"
+    assert lsvc._match_esm_filter({}, pat) is False
+
+
+def test_match_esm_filter_equals_ignore_case_in_a_dynamodb_image_with_exists():
+    """The reservation-lock-deleter filter: equals-ignore-case inside a NewImage path, next to
+    {"exists": false} alternatives on attributes the item may not have."""
+    pat = {
+        "eventName": [{"equals-ignore-case": "MODIFY"}],
+        "dynamodb": {"NewImage": {
+            "__edb_e__": {"S": [{"equals-ignore-case": "ReservationLock"}]},
+            "reservationLock": {"BOOL": [{"exists": False}, False]},
+            "orderLock": {"BOOL": [{"exists": False}, False]},
+        }},
+    }
+
+    def record(event_name="MODIFY", entity="reservationlock", **image):
+        return {"eventName": event_name,
+                "dynamodb": {"NewImage": {"__edb_e__": {"S": entity}, **image}}}
+
+    assert lsvc._match_esm_filter(record(reservationLock={"BOOL": False}, orderLock={"BOOL": False}), pat)
+    # An attribute the item lacks is absent all the way down, so {"exists": false} matches it.
+    assert lsvc._match_esm_filter(record(), pat)
+    assert lsvc._match_esm_filter(record(reservationLock={"BOOL": False}), pat)
+    assert not lsvc._match_esm_filter(record(reservationLock={"BOOL": True}), pat)
+    assert not lsvc._match_esm_filter(record(entity="Reservation"), pat)
+    assert not lsvc._match_esm_filter(record(event_name="INSERT"), pat)
+
+
+def test_match_esm_filter_operators_need_the_field_except_exists_false():
+    """Under a field the record lacks, only {"exists": false} matches; anything-but needs the field."""
+    rec = {"body": {"name": "x"}}
+    assert lsvc._match_esm_filter(rec, {"body": {"missing": {"inner": [{"exists": False}]}}}) is True
+    assert lsvc._match_esm_filter(rec, {"body": {"missing": {"inner": [{"exists": True}]}}}) is False
+    assert lsvc._match_esm_filter(rec, {"body": {"missing": [{"anything-but": ["y"]}]}}) is False
+    assert lsvc._match_esm_filter(rec, {"body": {"name": {"inner": ["x"]}}}) is False
+
+
+def test_apply_filter_criteria_equals_ignore_case_on_sqs_bodies():
+    import json as _json
+    esm = {"FilterCriteria": {"Filters": [
+        {"Pattern": _json.dumps({"body": {"status": [{"equals-ignore-case": "active"}]}})},
+    ]}}
+    records = [{"messageId": m, "body": _json.dumps({"status": m})} for m in ("ACTIVE", "Active", "inactive")]
+    assert [r["messageId"] for r in lsvc._apply_filter_criteria(records, esm)] == ["ACTIVE", "Active"]
 
 
 def test_match_esm_filter_numeric():

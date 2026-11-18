@@ -3899,7 +3899,10 @@ def _match_esm_filter(record: dict, pattern: dict) -> bool:
     for key, pat in pattern.items():
         rec_val = record.get(key)
         if isinstance(pat, dict):
-            if not isinstance(rec_val, dict) or not _match_esm_filter(rec_val, pat):
+            # A field the record lacks is absent all the way down, so only an
+            # {"exists": false} under it can match (as in EventBridge, whose
+            # pattern syntax FilterCriteria uses).
+            if not _match_esm_filter(rec_val if isinstance(rec_val, dict) else {}, pat):
                 return False
         elif isinstance(pat, list):
             # Each entry can be a scalar equality check or a content-filter dict
@@ -3918,11 +3921,18 @@ def _match_esm_filter(record: dict, pattern: dict) -> bool:
                     elif "suffix" in p:
                         if isinstance(rec_val, str) and rec_val.endswith(p["suffix"]):
                             matched_any = True; break
+                    elif "equals-ignore-case" in p:
+                        # EventBridge's matcher, so case folding agrees with rules
+                        # and Pipes filters; only a string value can match.
+                        from ministack.services.eventbridge import _matches_equals_ignore_case
+                        if _matches_equals_ignore_case(rec_val, p["equals-ignore-case"]):
+                            matched_any = True; break
                     elif "anything-but" in p:
                         banned = p["anything-but"]
                         if not isinstance(banned, list):
                             banned = [banned]
-                        if rec_val not in banned:
+                        # Like every operator but {"exists": false}, it needs the field.
+                        if key in record and rec_val not in banned:
                             matched_any = True; break
                     elif "numeric" in p:
                         ops = p["numeric"]
@@ -7778,6 +7788,27 @@ _dynamodb_stream_positions_lock = threading.Lock()
 # persisted — a warm boot simply starts with no cooldowns in effect.
 _esm_backoff_until = AccountRegionScopedDict()
 _ESM_BACKOFF_SECONDS = 1.0
+# Failed invocations of the batch a stream mapping is stuck on, per mapping and
+# shard: (position, failures). MaximumRetryAttempts counts against it.
+_esm_batch_failures = AccountRegionScopedDict()
+
+
+def _stream_batch_retries_exhausted(esm, shard_key, pos):
+    """Count a failed invocation of the batch at `pos`; True once the mapping's
+    MaximumRetryAttempts retries are spent (-1 or absent: retry until the records
+    expire, as AWS does). The first invocation is not a retry, so a batch is
+    invoked MaximumRetryAttempts + 1 times before it is discarded."""
+    key = f"{esm['UUID']}|{shard_key}"
+    last_pos, failures = _esm_batch_failures.get(key, (pos, 0))
+    failures = failures + 1 if last_pos == pos else 1
+    _esm_batch_failures[key] = (pos, failures)
+    max_retries = esm.get("MaximumRetryAttempts")
+    if max_retries is None or int(max_retries) < 0:
+        return False
+    if failures > int(max_retries):
+        _esm_batch_failures.pop(key, None)
+        return True
+    return False
 
 # SQS batches run off the poll thread so a slow handler can't stall other ESMs.
 # Per-ESM limit is ScalingConfig.MaximumConcurrency, else this default.
@@ -8208,6 +8239,20 @@ def _poll_kinesis():
                         "ESM: Lambda %s failed processing Kinesis batch from %s/%s (errorType=%s errorMessage=%s)\n%s",
                         func_name, stream_name, shard_id, err_type, err_msg, result.get("log", ""),
                     )
+                    # MaximumRetryAttempts spent: discard the batch to the
+                    # OnFailure destination and move past it, as AWS does, so
+                    # one poison record cannot hold the shard forever.
+                    if _stream_batch_retries_exhausted(esm, shard_id, pos):
+                        logger.warning(
+                            "ESM: Lambda %s discarded a Kinesis batch from %s/%s after %s retries",
+                            func_name, stream_name, shard_id, esm.get("MaximumRetryAttempts"),
+                        )
+                        _send_kinesis_failure_record(
+                            esm, func_rec, raw_records, shard_id, source_arn, result,
+                            "RetryAttemptsExhausted")
+                        positions[shard_id] = pos + len(raw_records)
+                        processed_any = True
+                        continue
                     # Position doesn't advance on failure, so the next pass
                     # would refetch this exact batch — don't report it as
                     # processed.
@@ -8215,6 +8260,7 @@ def _poll_kinesis():
                 else:
                     processed_any = True
                     _esm_backoff_until.pop(esm_id, None)
+                    _esm_batch_failures.pop(f"{esm_id}|{shard_id}", None)
                     positions[shard_id] = pos + len(raw_records)
                     esm["LastProcessingResult"] = "OK"
                     log_output = result.get("log", "")
@@ -8272,7 +8318,54 @@ def _send_ddb_stream_failure_record(esm, func_rec, batch, stream_arn, result, co
             "streamArn": stream_arn,
         },
     }
-    body = json.dumps(envelope)
+    _dispatch_stream_failure_record(dest, json.dumps(envelope))
+
+
+def _send_kinesis_failure_record(esm, func_rec, raw_records, shard_id, stream_arn, result, condition):
+    """Send a Kinesis ESM on-failure invocation record (AWS's `KinesisBatchInfo`
+    shape; the records themselves are not included) to the mapping's
+    `DestinationConfig.OnFailure` target (SQS/SNS)."""
+    dest = ((esm.get("DestinationConfig") or {}).get("OnFailure") or {}).get("Destination")
+    if not dest:
+        return
+    config = func_rec.get("config") or func_rec
+
+    def _iso(ts):
+        return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts)))
+
+    first = raw_records[0] if raw_records else {}
+    last = raw_records[-1] if raw_records else {}
+    now = time.time()
+    envelope = {
+        "requestContext": {
+            "requestId": new_uuid(),
+            "functionArn": config.get("FunctionArn", ""),
+            "condition": condition,
+            "approximateInvokeCount": int(esm.get("MaximumRetryAttempts") or 0) + 1,
+        },
+        "responseContext": {
+            "statusCode": 200,
+            "executedVersion": "$LATEST",
+            "functionError": result.get("function_error") or "Unhandled",
+        },
+        "version": "1.0",
+        "timestamp": _iso(now),
+        "KinesisBatchInfo": {
+            "shardId": shard_id,
+            "startSequenceNumber": str(first.get("SequenceNumber", "")),
+            "endSequenceNumber": str(last.get("SequenceNumber", "")),
+            "approximateArrivalOfFirstRecord": _iso(first.get("ApproximateArrivalTimestamp", now)),
+            "approximateArrivalOfLastRecord": _iso(last.get("ApproximateArrivalTimestamp", now)),
+            "batchSize": len(raw_records),
+            "streamArn": stream_arn,
+        },
+    }
+    _dispatch_stream_failure_record(dest, json.dumps(envelope))
+
+
+def _dispatch_stream_failure_record(dest, body):
+    """Deliver a stream mapping's on-failure record to its SQS queue or SNS topic."""
+    now = time.time()
     try:
         spec = parse_arn(dest)
     except ArnParseError:
@@ -8296,7 +8389,7 @@ def _send_ddb_stream_failure_record(esm, func_rec, batch, stream_arn, result, co
             if dest in _sns._topics:
                 _sns._fanout(dest, new_uuid(), body, "Lambda ESM failure", "", {})
     except Exception as exc:
-        logger.error("DynamoDB ESM on-failure dispatch failed: %s", exc)
+        logger.error("Stream ESM on-failure dispatch failed: %s", exc)
 
 
 def _poll_dynamodb_streams():
@@ -8406,6 +8499,17 @@ def _poll_dynamodb_streams():
                             _dynamodb_stream_positions[esm_id] = pos + raw_len
                         processed_any = True
                         continue
+                if _stream_batch_retries_exhausted(esm, "ddb", pos):
+                    logger.warning(
+                        "ESM: Lambda %s discarded a DynamoDB stream batch from %s after %s retries",
+                        func_name, table_name, esm.get("MaximumRetryAttempts"),
+                    )
+                    _send_ddb_stream_failure_record(
+                        esm, func_rec, batch, source_arn, result, "RetryAttemptsExhausted")
+                    with _dynamodb_stream_positions_lock:
+                        _dynamodb_stream_positions[esm_id] = pos + raw_len
+                    processed_any = True
+                    continue
                 # Position doesn't advance on failure, so the next pass
                 # would refetch this exact batch — don't report it as
                 # processed.
@@ -8413,6 +8517,7 @@ def _poll_dynamodb_streams():
             else:
                 processed_any = True
                 _esm_backoff_until.pop(esm_id, None)
+                _esm_batch_failures.pop(f"{esm_id}|ddb", None)
                 with _dynamodb_stream_positions_lock:
                     _dynamodb_stream_positions[esm_id] = pos + raw_len
                 esm["LastProcessingResult"] = "OK"

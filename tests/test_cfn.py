@@ -25095,9 +25095,10 @@ def test_cfn_cognito_user_pool_group_under_generated_name_moves_and_renames(cfn,
 
 
 _COGNITO_POOL_PROPERTY_CHANGES = [
+    # Triggers AdminCreateUser does not fire: the test's user is made between the two templates.
     ("LambdaConfig",
-     {"PreSignUp": "arn:aws:lambda:us-east-1:000000000000:function:pre-signup-v1"},
-     {"PreSignUp": "arn:aws:lambda:us-east-1:000000000000:function:pre-signup-v2",
+     {"PostAuthentication": "arn:aws:lambda:us-east-1:000000000000:function:post-auth-v1"},
+     {"PostAuthentication": "arn:aws:lambda:us-east-1:000000000000:function:post-auth-v2",
       "PostConfirmation": "arn:aws:lambda:us-east-1:000000000000:function:post-confirm"}),
     ("AdminCreateUserConfig",
      {"AllowAdminCreateUserOnly": False, "UnusedAccountValidityDays": 7},
