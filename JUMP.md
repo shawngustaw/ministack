@@ -22,6 +22,7 @@ Based on upstream release **1.5.41** (`837b11b5`).
 | `feat(pipes): deliver to SQS queues and EventBridge event buses` | Pipes to an SQS queue or an event bus hold every record. | Pipes event bus and SQS targets (to be filed) |
 | `feat(pipes): apply SourceParameters.FilterCriteria` | Pipes deliver every record, ignoring the filter. | Pipes FilterCriteria and InputTemplate (to be filed) |
 | `feat(pipes): apply TargetParameters.InputTemplate` | Pipes deliver the raw record, ignoring the input template. | Pipes FilterCriteria and InputTemplate (to be filed) |
+| `feat(eventbridge): deliver to Kinesis stream targets` | A rule targeting a Kinesis stream logs "unsupported target type" and delivers nothing (pro-event-bridge's offers go to the pro-offer stream this way). | EventBridge Kinesis targets (to be filed) |
 | `ci: build Jump's image on GitLab` | This file and `.gitlab-ci.yml`. Jump only. | none |
 
 Fill in the issue links once they are filed. When upstream fixes one, drop its commit at the

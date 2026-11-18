@@ -2553,6 +2553,8 @@ def _invoke_target(target, event, rule, view=None, from_rule=True):
                                arn, target.get("RoleArn"))
         elif spec.service == "sns":
             _dispatch_to_sns(arn, event_payload)
+        elif spec.service == "kinesis":
+            _dispatch_to_kinesis(arn, event_payload, target.get("KinesisParameters") or {}, view)
         elif spec.service == "logs":
             _dispatch_to_log_group(spec, event_payload, event, rule)
         else:
@@ -2843,6 +2845,32 @@ def _dispatch_to_lambda(arn, payload):
         target=lambda_svc._execute_function_with_config_scope, args=(exec_record, event), daemon=True
     ).start()
     logger.info("EventBridge → Lambda %s: dispatched", func_name)
+
+
+def _dispatch_to_kinesis(arn, payload, kinesis_parameters, view):
+    """Dispatch an EventBridge event to a Kinesis data stream: one record whose
+    data is the delivered payload (the event, or what its input transformer made).
+
+    The partition key is ``KinesisParameters.PartitionKeyPath`` resolved against
+    the event; without one AWS uses the event's id ("If you do not include this
+    parameter, the default is to use the eventId as the partition key").
+    """
+    from ministack.services import kinesis as _kinesis
+
+    event = view.event_with_detail()
+    partition_key = str(event.get("id") or new_uuid())
+    key_path = kinesis_parameters.get("PartitionKeyPath")
+    if key_path:
+        value = event
+        try:
+            for part in key_path.strip("$.").split("."):
+                if part:
+                    value = value[part]
+            partition_key = value if isinstance(value, str) else json.dumps(value)
+        except (KeyError, TypeError, IndexError):
+            pass
+    if not _kinesis.put_record_internal(arn, partition_key, payload.encode()):
+        logger.warning("EventBridge → Kinesis: stream %s not found or not active", arn)
 
 
 def _dispatch_to_sqs(spec, payload, sqs_parameters=None):

@@ -1547,6 +1547,56 @@ def test_eventbridge_input_transformer(eb, sqs):
     assert body.get("transformed") == "myapp"
 
 
+def test_eventbridge_kinesis_target_puts_the_transformed_event(eb, kin):
+    """A Kinesis stream target gets one record per matched event: the input
+    transformer's output as its data, partitioned by PartitionKeyPath."""
+    bus_name = "qa-eb-kinesis-bus"
+    stream = "qa-eb-kinesis-stream"
+    eb.create_event_bus(Name=bus_name)
+    kin.create_stream(StreamName=stream, ShardCount=1)
+    stream_arn = kin.describe_stream(StreamName=stream)["StreamDescription"]["StreamARN"]
+    eb.put_rule(
+        Name="qa-eb-kinesis-rule",
+        EventBusName=bus_name,
+        EventPattern=json.dumps({"detail-type": ["offer:created"]}),
+        State="ENABLED",
+    )
+    eb.put_targets(
+        Rule="qa-eb-kinesis-rule",
+        EventBusName=bus_name,
+        Targets=[
+            {
+                "Id": "k1",
+                "Arn": stream_arn,
+                "KinesisParameters": {"PartitionKeyPath": "$.detail.offerId"},
+                "InputTransformer": {
+                    "InputPathsMap": {"data": "$.detail.entityData"},
+                    "InputTemplate": '{"data": <data>}',
+                },
+            }
+        ],
+    )
+    shard_id = kin.describe_stream(StreamName=stream)["StreamDescription"]["Shards"][0]["ShardId"]
+    iterator = kin.get_shard_iterator(StreamName=stream, ShardId=shard_id, ShardIteratorType="LATEST")[
+        "ShardIterator"
+    ]
+    eb.put_events(
+        Entries=[
+            {
+                "Source": "pro",
+                "DetailType": "offer:created",
+                "Detail": json.dumps({"offerId": "42", "entityData": {"id": 42}}),
+                "EventBusName": bus_name,
+            },
+            {"Source": "pro", "DetailType": "other", "Detail": "{}", "EventBusName": bus_name},
+        ]
+    )
+    records = kin.get_records(ShardIterator=iterator)["Records"]
+    assert len(records) == 1
+    assert json.loads(records[0]["Data"]) == {"data": {"id": 42}}
+    assert records[0]["PartitionKey"] == "42"
+
+
 def test_eventbridge_put_events_with_arn_as_bus_name(eb, sqs):
     """PutEvents with an ARN as EventBusName should dispatch to rules using the bus name."""
     bus_name = "qa-eb-arn-bus"
